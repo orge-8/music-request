@@ -1,0 +1,44 @@
+{
+  "manifest_version": 2,
+  "id": "github.cateye.music-request",
+  "version": "1.4.0",
+  "name": "点歌插件",
+  "description": "搜索点歌、解析音乐链接与分享卡片，发送语音音频或音乐卡片，支持网易云音乐与QQ音乐。搜索结果按相关度排序并做相对过滤，避免最佳匹配因版权不可播时改播无关歌曲。",
+  "author": {
+    "name": "cateye",
+    "url": "https://github.com/cateye"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/cateye/music-request"
+  },
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.5.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [
+    {
+      "type": "python_package",
+      "name": "httpx",
+      "version_spec": ">=0.27.0"
+    },
+    {
+      "type": "python_package",
+      "name": "cryptography",
+      "version_spec": ">=42.0.0"
+    }
+  ],
+  "capabilities": [
+    "send.text",
+    "send.custom",
+    "chat.get_all_streams"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN"
+  },
+  "plugin_type": "extension"
+}
