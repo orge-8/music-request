@@ -49,6 +49,9 @@ logger = logging.getLogger("plugin.music-request.api")
 
 # 单次上游请求超时（秒）——所有外调都必须有上限
 REQUEST_TIMEOUT = 10.0
+# NapCat 文件上传超时（秒）：upload_*_file 要等 QQ 完成文件传输，10s 通用超时不够
+# （真机实锤 2026-09-11：私聊文件上传在 10s 处 ReadTimeout，实际需要数十秒）
+NAPCAT_UPLOAD_TIMEOUT = 120.0
 
 # 落日志的响应预览长度，避免一个异常响应淹没整个日志
 _PREVIEW_LIMIT = 400
@@ -230,12 +233,24 @@ class MusicSearchClient:
         )
         self._napcat: httpx.AsyncClient | None = None
         if napcat_url:
+            # httpx 对无协议头的 URL（如 "127.0.0.1:9999"）会抛 UnsupportedProtocol；
+            # 真机实锤（2026-09-11）：配置漏写 http:// 前缀导致 upload_private_file 直接失败。
+            # 这里做归一化兜底：无协议头自动补 http://，尾斜杠统一去掉。
+            url = napcat_url.strip().rstrip("/")
+            if url and not url.startswith(("http://", "https://")):
+                logger.info("napcat.http_url 缺少协议头，自动补全: %r -> http://%s", napcat_url, url)
+                url = f"http://{url}"
             headers = {"Content-Type": "application/json"}
             if napcat_token:
                 headers["Authorization"] = f"Bearer {napcat_token}"
             self._napcat = httpx.AsyncClient(
-                base_url=napcat_url, headers=headers, timeout=REQUEST_TIMEOUT,
+                base_url=url, headers=headers,
+                # 通用超时给非上传动作；上传动作在调用点单独放宽（见 napcat_upload_file）
+                timeout=REQUEST_TIMEOUT,
             )
+            # 单独放宽上传超时：httpx.AsyncClient 的 per-request timeout 在 AsyncClient 上
+            # 以请求级参数为准，这里存一份供 napcat_upload_file 使用
+            self._napcat_upload_timeout = NAPCAT_UPLOAD_TIMEOUT
 
     # ---------- 生命周期 ----------
 
@@ -942,11 +957,16 @@ class MusicSearchClient:
             return False, {}
 
         try:
-            resp = await self._napcat.post(path, json=payload)
+            # 上传动作单独放宽超时：QQ 完成文件传输可能要数十秒，通用 10s 会 ReadTimeout
+            upload_timeout = getattr(self, "_napcat_upload_timeout", NAPCAT_UPLOAD_TIMEOUT)
+            resp = await self._napcat.post(path, json=payload, timeout=upload_timeout)
             resp.raise_for_status()
             data = resp.json()
         except Exception as exc:
-            logger.warning("NapCat 上传文件失败: path=%s error=%s", path, type(exc).__name__)
+            logger.warning(
+                "NapCat 上传文件失败: path=%s error=%s（超时 %ss，大文件/慢盘可能仍不够）",
+                path, type(exc).__name__, getattr(self, "_napcat_upload_timeout", NAPCAT_UPLOAD_TIMEOUT),
+            )
             return False, {}
         if not isinstance(data, dict):
             logger.warning("NapCat 上传文件响应异常: path=%s", path)

@@ -76,7 +76,7 @@ __plugin_id__ = "github.cateye.music-request"
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_CONFIG_VERSION = "1.4.0"
+SUPPORTED_CONFIG_VERSION = "1.4.3"
 
 # 待选列表的默认有效期（秒）
 _DEFAULT_SELECT_TTL = 300
@@ -89,6 +89,15 @@ _PREFIX_NORMALIZE = {
 
 # OneBot CQ 码里展示文本需要转义的字符
 _CQ_TEXT_ESCAPES = {"&": "&amp;", ",": "&#44;", "[": "&#91;", "]": "&#93;"}
+
+# 触发消息里的「发文件」意图关键词：LLM 点歌时若能取到触发消息文本，
+# 命中关键词则无视 send_as 缺省强制用 file 形态。
+# 真机实锤（2026-09-11）：用户明说「发晚安糖果罐的文件」，LongCat 只传了
+# query 没传 send_as=file，结果按默认 voice 发了语音——靠工具描述里的提示
+# 让模型自觉传参不可靠，代码层兜底才是硬约束。
+_RE_FILE_INTENT = re.compile(
+    r"发.{0,6}(文件|无损)|音频文件|要好音质|好音质|太长.{0,4}(发|要)?文件|(发|要)flac|(发|要)ape|(要|来|来个|来份|给我)无损|无损.{0,4}(音质|版本|文件)"
+)
 
 # 命令通用的前缀捕获组（任意单个非空白/非单词字符，取值由处理器校验）
 _PFX = r"(?P<pfx>[^\w\s])"
@@ -1301,6 +1310,14 @@ class MusicRequestPlugin(MaiBotPlugin):
             return {"content": "当前会话缺少 stream_id，无法发送歌曲"}
 
         mode = self._resolve_send_as(send_as)
+        # 代码层兜底：触发消息里明确要「文件/无损/好音质」时强制 file 形态，
+        # 不依赖 LLM 自觉传 send_as（LongCat 实测会漏传）
+        trigger_text = self._extract_text(kwargs)
+        if mode != "file" and trigger_text and _RE_FILE_INTENT.search(trigger_text):
+            mode = "file"
+            self.ctx.logger.info(
+                "触发消息含「发文件」意图，强制 file 形态: %.60s", trigger_text
+            )
         default = self._resolve_platform("")
         platforms = [default, PLATFORM_QQ if default == PLATFORM_NETEASE else PLATFORM_NETEASE]
         failures: List[str] = []

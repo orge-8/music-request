@@ -27,6 +27,7 @@ from audio_cache import (
     write_cache_probe,
 )
 from music_api import MusicSearchClient, SongInfo, eapi_encrypt
+import music_api as client_module
 from plugin import MusicRequestPlugin
 
 PLUGIN_DIR = pathlib.Path(__file__).resolve().parent.parent
@@ -801,9 +802,11 @@ class _FakeNapCat:
     def __init__(self, payload=None) -> None:
         self.payload = payload or {"status": "ok"}
         self.calls: list[tuple[str, dict]] = []
+        self.last_timeout = None
 
-    async def post(self, path, json=None):
+    async def post(self, path, json=None, timeout=None):
         self.calls.append((path, json or {}))
+        self.last_timeout = timeout
         payload = self.payload
 
         class _Resp:
@@ -862,3 +865,40 @@ def test_napcat_upload_file_reports_business_failure() -> None:
     ok, _data = asyncio.run(client.napcat_upload_file("/a.flac", group_id="123"))
 
     assert ok is False
+
+
+def test_napcat_upload_file_uses_extended_timeout() -> None:
+    """上传动作必须用放宽后的超时（120s），不能用通用 10s。
+    真机实锤（2026-09-11）：私聊文件上传 10s 处 ReadTimeout。"""
+    client = MusicSearchClient(napcat_url="http://127.0.0.1:9999")
+    napcat = _FakeNapCat()
+    client._napcat = napcat
+
+    ok, _data = asyncio.run(client.napcat_upload_file("/a.flac", user_id="888"))
+
+    assert ok is True
+    assert napcat.calls[0][0] == "/upload_private_file"
+    assert napcat.last_timeout == client_module.NAPCAT_UPLOAD_TIMEOUT
+
+
+def test_napcat_url_without_scheme_gets_http_prefix() -> None:
+    """真机实锤（2026-09-11）：http_url 漏写 http:// 时 httpx 抛 UnsupportedProtocol，
+    上传文件/直连发送全部失败。构造客户端时必须自动补全协议头。"""
+    for raw, expected in (
+        ("127.0.0.1:9999", "http://127.0.0.1:9999"),
+        ("  127.0.0.1:9999  ", "http://127.0.0.1:9999"),
+        ("127.0.0.1:9999/", "http://127.0.0.1:9999"),
+        ("http://127.0.0.1:9999/", "http://127.0.0.1:9999"),
+        ("https://napcat.example.com", "https://napcat.example.com"),
+    ):
+        client = MusicSearchClient(napcat_url=raw)
+        assert client._napcat is not None, raw
+        base = str(client._napcat.base_url).rstrip("/")
+        assert base == expected, f"napcat_url={raw!r}: got {base!r}, want {expected!r}"
+        asyncio.run(client.close())
+
+
+def test_napcat_url_empty_disables_direct_client() -> None:
+    """http_url 留空时不创建直连客户端（保持原语义）。"""
+    client = MusicSearchClient(napcat_url="   ")
+    assert client._napcat is None
