@@ -138,6 +138,44 @@ def test_点歌_pattern_rejects(text: str) -> None:
     assert re.search(_command_pattern("cmd_点歌"), text) is None, f"点歌正则误匹配: {text}"
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "发一首万能处方的文件",
+        "发晚安糖果罐的文件",
+        "发个文件",
+        "我要无损",
+        "要好音质",
+        "这歌太长发文件吧",
+        "来个无损音质的",
+        "来无损",
+        "要flac",
+        "给我发ape",
+        "发一份无损",
+    ],
+)
+def test_file_intent_pattern_matches(text: str) -> None:
+    """用户明确要文件/无损时，必须能识别（含中间夹歌名的情况）。"""
+    assert plugin_module._RE_FILE_INTENT.search(text), f"文件意图失配: {text}"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "放一首万能处方",
+        "放一下万能处方",
+        "来一首万能处方",
+        "放歌",
+        "随便放点音乐",
+        "我想听万能处方",
+        "放个歌吧",
+    ],
+)
+def test_file_intent_pattern_rejects(text: str) -> None:
+    """普通点歌话术绝不能命中文件意图（真机实锤：误判会让用户收到文件）。"""
+    assert plugin_module._RE_FILE_INTENT.search(text) is None, f"文件意图误匹配: {text}"
+
+
 @pytest.mark.parametrize("text", ["/选歌 1", "#选歌 12"])
 def test_选歌_pattern_matches(text: str) -> None:
     assert re.search(_command_pattern("cmd_选歌"), text)
@@ -794,6 +832,160 @@ def test_file_mode_degrades_to_card_without_napcat() -> None:
     assert cards and cards[0].get("data") == {"type": "163", "id": _TARGET_SONG.song_id}, cards
     assert api.uploads == [], "不该在拿不到目标时上传文件"
     assert any("已改为发送音乐卡片" in (t or "") for t in host.sent_texts), host.sent_texts
+
+
+def test_tool_reports_degrade_when_upload_fails() -> None:
+    """工具返回文本必须如实说明「已降级为卡片」。
+
+    真机实锤（2026-09-11）：上传失败降级后工具仍返回「已发送文件」，
+    reply 模型据此对用户说「文件版《哑巴》你看看收到没」，实际收到的是卡片。
+    """
+    plugin, host = _prepare_plugin(play_mode="file")
+    api = _ScenarioAPI([_TARGET_SONG], unplayable=set())
+    api.upload_ok = False  # NapCat 上传失败 → 应走降级
+    plugin._api = api
+    plugin._cache = _FakeCache()
+
+    result = asyncio.run(
+        plugin.search_and_play_music(query="晚安糖果罐", send_as="file", stream_id="s1")
+    )
+
+    content = result["content"]
+    assert "音乐卡片" in content, content
+    assert "已发送文件" not in content, f"降级后不该说已发送文件: {content}"
+    assert "不要再说" in content, f"应明确禁止 reply 谎报文件: {content}"
+    # 卡片确实发出去了
+    cards = host.calls_of("send.custom")
+    assert cards and cards[0].get("data") == {"type": "163", "id": _TARGET_SONG.song_id}, cards
+
+
+def test_tool_reports_file_when_upload_succeeds() -> None:
+    """正向对照：上传成功时仍报「已发送文件」，不能被降级文案污染。"""
+    plugin, host = _prepare_plugin(play_mode="file")
+    api = _ScenarioAPI([_TARGET_SONG], unplayable=set())
+    api.upload_ok = True
+    plugin._api = api
+    plugin._cache = _FakeCache()
+    # 工具拿不到 message 时按 stream_id 反查聊天流；测试里直接注入缓存目标
+    plugin._qq_targets["s1"] = {"user_id": "3816023959"}
+
+    result = asyncio.run(
+        plugin.search_and_play_music(query="晚安糖果罐", send_as="file", stream_id="s1")
+    )
+
+    assert result["content"].startswith("已发送文件"), result
+    assert "音乐卡片" not in result["content"], result
+    assert api.uploads, "成功路径应真的上传了文件"
+
+
+def test_send_file_outcome_reflects_degrade() -> None:
+    """_send_file 的 outcome 出参必须写回真实形态与降级原因。"""
+    plugin, host = _prepare_plugin(play_mode="file")
+    api = _ScenarioAPI([_TARGET_SONG], unplayable=set())
+    api.upload_ok = False
+    plugin._api = api
+    plugin._cache = _FakeCache()
+
+    outcome: dict[str, str] = {}
+    asyncio.run(plugin._send_file(_TARGET_SONG, "s1", silent=True, outcome=outcome))
+
+    assert outcome.get("kind") == "card_degraded", outcome
+    assert outcome.get("reason"), "降级必须带原因"
+
+
+def test_describe_outcome_variants() -> None:
+    """文案分派：三种形态 + 取不到音频，各有独立话术。"""
+    describe = plugin_module.MusicRequestPlugin._describe_outcome
+    song = _TARGET_SONG
+
+    assert describe(song, "file", {"kind": "file"}) == f"已发送文件: {song.display()}"
+    assert describe(song, "file", {}).startswith("已发送文件"), "缺 outcome 时按 mode 兜底"
+    assert "已播放" in describe(song, "voice", {"kind": "voice"})
+    assert "音乐卡片" in describe(song, "card", {"kind": "card"})
+    assert "未返回可用音频" in describe(song, "file", {"kind": "unavailable"})
+    degraded = describe(song, "file", {"kind": "card_degraded", "reason": "NapCat 上传失败"})
+    assert "NapCat 上传失败" in degraded and "音乐卡片" in degraded, degraded
+
+
+def test_llm_send_as_file_without_user_intent_falls_back() -> None:
+    """LLM 自作主张传 file、但用户没提 → 回落配置默认形态。
+
+    真机实锤（2026-09-12）：配置 tool_default_mode=voice，用户只说
+    「放一首万能处方」，却因模型传了 send_as=file 收到了文件（而非语音）。
+    """
+    plugin, host = _prepare_plugin()  # tool_default_mode 默认 voice
+    api = _ScenarioAPI([_TARGET_SONG], unplayable=set())
+    api.upload_ok = True
+    plugin._api = api
+    plugin._cache = _FakeCache()
+    plugin._qq_targets["s1"] = {"user_id": "3816023959"}
+
+    result = asyncio.run(
+        plugin.search_and_play_music(
+            query="万能处方", send_as="file", stream_id="s1",
+            processed_plain_text="放一首万能处方",
+        )
+    )
+
+    assert result["content"].startswith("已播放"), f"应回落语音而非发文件: {result}"
+    assert api.uploads == [], "用户没要文件时不该上传文件"
+    customs = host.calls_of("send.custom")
+    assert customs and customs[0].get("custom_type") == "voiceurl", customs
+
+
+def test_user_file_intent_still_wins() -> None:
+    """反向对照：用户明说要文件时，即使 LLM 没传 send_as 也要发文件。"""
+    plugin, host = _prepare_plugin()
+    api = _ScenarioAPI([_TARGET_SONG], unplayable=set())
+    api.upload_ok = True
+    plugin._api = api
+    plugin._cache = _FakeCache()
+    plugin._qq_targets["s1"] = {"user_id": "3816023959"}
+
+    result = asyncio.run(
+        plugin.search_and_play_music(
+            query="万能处方", stream_id="s1",
+            processed_plain_text="发一首万能处方的文件",
+        )
+    )
+
+    assert result["content"].startswith("已发送文件"), result
+    assert api.uploads, "用户明确要文件时必须上传"
+
+
+def test_llm_send_as_file_kept_when_user_intent_present() -> None:
+    """LLM 传 file 且用户确实要文件 → 保持一致，回落后不该误伤。"""
+    plugin, host = _prepare_plugin()
+    api = _ScenarioAPI([_TARGET_SONG], unplayable=set())
+    api.upload_ok = True
+    plugin._api = api
+    plugin._cache = _FakeCache()
+    plugin._qq_targets["s1"] = {"user_id": "3816023959"}
+
+    result = asyncio.run(
+        plugin.search_and_play_music(
+            query="万能处方", send_as="file", stream_id="s1",
+            processed_plain_text="要无损的，发个文件",
+        )
+    )
+
+    assert result["content"].startswith("已发送文件"), result
+
+
+def test_no_trigger_text_does_not_fall_back() -> None:
+    """拿不到触发消息文本时不做回落判断（避免误伤命令/卡片解析路径）。"""
+    plugin, host = _prepare_plugin()
+    api = _ScenarioAPI([_TARGET_SONG], unplayable=set())
+    api.upload_ok = True
+    plugin._api = api
+    plugin._cache = _FakeCache()
+    plugin._qq_targets["s1"] = {"user_id": "3816023959"}
+
+    result = asyncio.run(
+        plugin.search_and_play_music(query="万能处方", send_as="file", stream_id="s1")
+    )
+
+    assert result["content"].startswith("已发送文件"), f"无触发文本时应尊重 LLM 入参: {result}"
 
 
 class _FakeNapCat:

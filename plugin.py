@@ -76,7 +76,7 @@ __plugin_id__ = "github.cateye.music-request"
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_CONFIG_VERSION = "1.4.3"
+SUPPORTED_CONFIG_VERSION = "1.4.6"
 
 # 待选列表的默认有效期（秒）
 _DEFAULT_SELECT_TTL = 300
@@ -95,9 +95,47 @@ _CQ_TEXT_ESCAPES = {"&": "&amp;", ",": "&#44;", "[": "&#91;", "]": "&#93;"}
 # 真机实锤（2026-09-11）：用户明说「发晚安糖果罐的文件」，LongCat 只传了
 # query 没传 send_as=file，结果按默认 voice 发了语音——靠工具描述里的提示
 # 让模型自觉传参不可靠，代码层兜底才是硬约束。
+#
+# 注意：本正则只回答「这一句里提到文件关键词了吗」，**不判断是否定/反问**。
+# 否定语境（「不要发文件」「为什么要发文件」）由 _has_file_intent 逐句过滤，
+# 不能只看正则——真机/QA 实锤（2026-09-12）：纯正则会把否定句当正向意图，
+# 反向兜底随即把形态从 voice 强制成 file，用户明说不要文件反而收到文件。
 _RE_FILE_INTENT = re.compile(
-    r"发.{0,6}(文件|无损)|音频文件|要好音质|好音质|太长.{0,4}(发|要)?文件|(发|要)flac|(发|要)ape|(要|来|来个|来份|给我)无损|无损.{0,4}(音质|版本|文件)"
+    # 不在句内跨越句读符号，避免把相邻小句的词拼成一个意图
+    r"发[^，。！？；、\n]{0,14}(文件|无损)|音频文件|好音质"
+    r"|(发|要|给|来)(我)?(个|首|份|一下)?[^，。！？；、\n]{0,12}?(flac|ape)"
+    r"|(要|来|来个|来份|给我)无损|无损.{0,4}(音质|版本|文件)",
+    re.IGNORECASE,
 )
+
+# 否定 / 反问词：与文件关键词同现于同一小句时，视为「不要文件」
+_RE_FILE_INTENT_NEG = re.compile(r"不|别|勿|无需|免了|没必要|干嘛|干什么|为什么|为啥|咋")
+
+# 小句切分：按中英文标点与换行拆分，逐句独立判断意图
+_RE_CLAUSE_SPLIT = re.compile(r"[，。！？；、,.!?;\n]+")
+
+# 纯占位文本（如 [voiceurl消息] / [music消息]）：Host 生成的载荷占位符，
+# 不含用户表达，不应参与意图判断
+_RE_PLACEHOLDER_ONLY = re.compile(r"^\[[^\[\]]{1,24}\]$")
+
+
+def _has_file_intent(text: str) -> bool:
+    """判断触发消息是否**明确要求**「文件 / 无损 / 好音质」形态。
+
+    逐小句判断：某句命中文件关键词、且该句不含否定/反问词时才算数。
+    这样「不要发文件，放语音」「为什么要发文件？」「这首歌太长不要发文件」
+    都不会被误判为要文件，而「发一首万能处方的文件」照常命中。
+    """
+    if not text:
+        return False
+    for clause in _RE_CLAUSE_SPLIT.split(text):
+        clause = clause.strip()
+        if not clause or not _RE_FILE_INTENT.search(clause):
+            continue
+        if _RE_FILE_INTENT_NEG.search(clause):
+            continue  # 否定 / 反问语境，跳过
+        return True
+    return False
 
 # 命令通用的前缀捕获组（任意单个非空白/非单词字符，取值由处理器校验）
 _PFX = r"(?P<pfx>[^\w\s])"
@@ -112,6 +150,12 @@ def _build_qq_card_cq(payload: Dict[str, str]) -> str:
     """把 QQ音乐卡片字段拼成 NapCat 可识别的自定义音乐卡片 CQ 码。
 
     `audio` 为空时省略该参数，生成一张可点击跳转的卡片。
+
+    注意（待确认项）：URL / audio / image 字段**刻意不转义**——它们转义后
+    需要 NapCat 正确解码 `&amp;` / `&#44;` 才能还原，真机曾按「转了就打不开」
+    处理（见 tests/test_music_request.py::test_build_qq_card_cq_escapes_display_text_only）。
+    代价是 URL 里的 `,` / `]` 理论上能破坏 CQ 参数结构，属低危（仅能影响本次
+    卡片参数字段，不涉及凭据）。改动前需先在真机确认 NapCat 的解码行为。
     """
     parts = ["[CQ:music,type=custom", "url=" + payload["url"]]
     if payload.get("audio"):
@@ -276,7 +320,6 @@ class MusicRequestPlugin(MaiBotPlugin):
         # 语音发送期间持有该锁；配置热重载重建缓存时靠它等待在途请求结束
         self._cache_guard: Optional[asyncio.Lock] = None
         self._pending: Dict[str, Tuple[List[SongInfo], str, float]] = {}
-        self._pending_lock: Optional[asyncio.Lock] = None
         # stream_id -> {"group_id": ...} / {"user_id": ...}，供 NapCat 直连发送使用
         self._qq_targets: Dict[str, Dict[str, str]] = {}
         # 路径映射失败只提醒一次，避免每条语音都刷屏
@@ -752,7 +795,8 @@ class MusicRequestPlugin(MaiBotPlugin):
         注意：`card` 虽未在工具参数说明里宣传，但传了就照做——
         把不认识的取值静默替换成默认，属于「用户要 A 却给了 B」，正是要避免的毛病。
         """
-        value = (requested or "").strip().lower()
+        # 类型归一：非 str 入参（QA 实锤：send_as=123）直接 .strip() 会抛 AttributeError
+        value = requested.strip().lower() if isinstance(requested, str) else ""
         if value in ("card", "voice", "file"):
             return value
         if value:
@@ -761,20 +805,27 @@ class MusicRequestPlugin(MaiBotPlugin):
         return default if default in ("voice", "file") else "voice"
 
     async def _degrade_to_card(
-        self, song: SongInfo, stream_id: str, *, silent: bool, reason: str
+        self, song: SongInfo, stream_id: str, *, silent: bool, reason: str,
+        outcome: Dict[str, str] | None = None,
     ) -> bool:
         """文件形态不可用时降级为音乐卡片。
 
         刻意**不降级为语音**：用户选文件图的就是音质，而语音会把音质打到
         SILK 级别。卡片由官方播放器播放，是仅次于文件的形态。
-        降级必须留痕（日志 + 可选的用户提示），否则就变成静默换形态。
+        降级必须留痕（日志 + 可选的用户提示 + 工具返回文本），否则就变成静默换形态。
         """
         self.ctx.logger.warning("文件形态不可用，降级为音乐卡片: %s（%s）", song.display(), reason)
+        if outcome is not None:
+            outcome["kind"] = "card_degraded"
+            outcome["reason"] = reason
         if not silent:
             await self.ctx.send.text(f"暂时发不了文件（{reason}），已改为发送音乐卡片", stream_id)
         return await self._send_card(song, stream_id, silent=True)
 
-    async def _send_file(self, song: SongInfo, stream_id: str, *, silent: bool = False) -> bool:
+    async def _send_file(
+        self, song: SongInfo, stream_id: str, *, silent: bool = False,
+        outcome: Dict[str, str] | None = None,
+    ) -> bool:
         """把歌曲作为「群文件 / 私聊文件」发送，完整保留原始音质。
 
         这是唯一能绕开 QQ 语音转码（SILK ≈ 6–12 kbps + 60 秒上限）的形态：
@@ -785,7 +836,8 @@ class MusicRequestPlugin(MaiBotPlugin):
         target = await self._resolve_qq_target(stream_id)
         if target is None:
             return await self._degrade_to_card(
-                song, stream_id, silent=silent, reason="未配置 NapCat HTTP API 或拿不到群号/QQ号"
+                song, stream_id, silent=silent,
+                reason="未配置 NapCat HTTP API 或拿不到群号/QQ号", outcome=outcome,
             )
 
         guard = self._run_lock("_cache_guard")
@@ -793,7 +845,7 @@ class MusicRequestPlugin(MaiBotPlugin):
             cache = self._cache
             if cache is None:
                 return await self._degrade_to_card(
-                    song, stream_id, silent=silent, reason="音频缓存未启用"
+                    song, stream_id, silent=silent, reason="音频缓存未启用", outcome=outcome,
                 )
 
             media_id = song.media_id
@@ -816,6 +868,8 @@ class MusicRequestPlugin(MaiBotPlugin):
                 )
                 audio_url = None
             if not audio_url:
+                if outcome is not None:
+                    outcome["kind"] = "unavailable"
                 if not silent:
                     await self.ctx.send.text(
                         f"找到「{song.display()}」但音乐平台未返回可用音频", stream_id
@@ -827,7 +881,8 @@ class MusicRequestPlugin(MaiBotPlugin):
                 cache.retain(path)
             except AudioCacheError as exc:
                 return await self._degrade_to_card(
-                    song, stream_id, silent=silent, reason=f"音频下载失败（{exc}）"
+                    song, stream_id, silent=silent,
+                    reason=f"音频下载失败（{exc}）", outcome=outcome,
                 )
 
             try:
@@ -844,20 +899,31 @@ class MusicRequestPlugin(MaiBotPlugin):
 
         if ok:
             self.ctx.logger.info("已作为文件发送: %s（%s）", file_name, napcat_path)
+            if outcome is not None:
+                outcome["kind"] = "file"
+                outcome["file_name"] = file_name
             if not silent:
                 await self.ctx.send.text(f"已发送文件：{file_name}", stream_id)
             return True
         return await self._degrade_to_card(
-            song, stream_id, silent=silent, reason="NapCat 上传失败"
+            song, stream_id, silent=silent, reason="NapCat 上传失败", outcome=outcome,
         )
 
     async def _send_song(
-        self, song: SongInfo, stream_id: str, *, silent: bool = False, mode: str = ""
+        self, song: SongInfo, stream_id: str, *, silent: bool = False, mode: str = "",
+        outcome: Dict[str, str] | None = None,
     ) -> bool:
-        """按发送形态分发。`mode` 留空则用配置里的 `play_mode`。"""
+        """按发送形态分发。`mode` 留空则用配置里的 `play_mode`。
+
+        `outcome` 为可选出参：真实发送形态与降级原因会写回其中，
+        供 @Tool 生成**与实际一致**的工具返回文本（避免 reply 模型
+        看到「已发送文件」而用户实际收到卡片）。
+        """
         resolved = (mode or str(self.config.music.play_mode)).strip().lower()
         if resolved == "file":
-            return await self._send_file(song, stream_id, silent=silent)
+            return await self._send_file(song, stream_id, silent=silent, outcome=outcome)
+        if outcome is not None:
+            outcome["kind"] = "voice" if resolved == "voice" else "card"
         if resolved == "voice":
             return await self._send_voice(song, stream_id, silent=silent)
         return await self._send_card(song, stream_id, silent=silent)
@@ -997,7 +1063,6 @@ class MusicRequestPlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         """插件加载：初始化并发原语与音频缓存。"""
-        self._run_lock("_pending_lock")
         self._run_lock("_cache_guard")
         try:
             await self._start_cache()
@@ -1042,6 +1107,9 @@ class MusicRequestPlugin(MaiBotPlugin):
         except Exception:
             self.ctx.logger.exception("重建音频缓存失败")
         self.ctx.logger.info("点歌插件配置已更新，API 客户端与音频缓存已重置")
+        # 映射告警去重标记随配置重置：改完缓存/NapCat 路径后应重新提示一次，
+        # 否则用户修完配置也看不到核对提示
+        self._map_warned = False
 
     # ---------- @Command ----------
 
@@ -1257,12 +1325,39 @@ class MusicRequestPlugin(MaiBotPlugin):
 
     # ---------- @Tool ----------
 
+    @staticmethod
+    def _describe_outcome(song: SongInfo, mode: str, outcome: Dict[str, str]) -> str:
+        """按**真实发送形态**生成工具返回文本。
+
+        真机实锤（2026-09-11）：文件上传失败降级为卡片后，工具仍返回「已发送文件」，
+        reply 模型据此对用户说「文件版《哑巴》你看看收到没」，而用户实际收到卡片。
+        这里以 _send_file 写回的 outcome 为准，如实说明已降级，并提示可照实转述。
+        """
+        display = song.display()
+        kind = outcome.get("kind") or ("file" if mode == "file" else "voice")
+        if kind == "file":
+            return f"已发送文件: {display}"
+        if kind == "card_degraded":
+            reason = outcome.get("reason") or "文件发送不可用"
+            return (
+                f"歌曲「{display}」原本要发文件，但发文件失败（{reason}），"
+                "已改为发送音乐卡片。请如实告诉用户收到的是音乐卡片而不是文件，"
+                "不要再说「文件已发送」。"
+            )
+        if kind == "unavailable":
+            return f"找到「{display}」但音乐平台未返回可用音频"
+        if kind == "card":
+            return f"已以音乐卡片发送: {display}"
+        return f"已播放: {display}"
+
     @Tool(
         "search_and_play_music",
         description=(
-            "搜索歌曲并把歌发到当前聊天（语音消息或音频文件）。"
+            "搜索歌曲并把歌发到当前聊天。"
             "当用户想听歌、点歌、放首歌、找某首歌时使用；"
             "用户贴了歌词、正在聊某首歌并表示想听（如「放一下」「来一段」「我想听」）时也用这个工具。"
+            "**默认不要传 send_as**，插件会按配置的默认形态发送；"
+            "只有用户本条消息里明确要求「发文件 / 无损 / 要好音质」时才传 send_as=file。"
             "不要指定平台，插件会自动选可用平台并逐首尝试候选。"
             "本工具已内置换源与重试；若返回播放失败，不要重复调用，直接告诉用户即可。"
         ),
@@ -1270,13 +1365,17 @@ class MusicRequestPlugin(MaiBotPlugin):
             "参数 query 为歌曲名，或「歌名 歌手」关键词。"
             "若上下文里已有其它插件给出的「可点播查询」串，直接把整串填进 query；"
             "不要把一句歌词当 query，也不要自己另猜歌名。\n"
-            "参数 send_as 决定发送形态，**默认 voice**：\n"
-            "- voice：语音消息，点开即播，最省事（默认，不确定时就用它）；\n"
-            "- file：音频文件，保留原始音质、不受 QQ 语音转码与 60 秒限制，"
-            "适合用户明确说「要好音质 / 发文件 / 这歌太长」，或语音发出来效果差的场景。\n"
+            "参数 send_as：**绝大多数情况留空不传**，留空时按插件配置的默认形态发送。\n"
+            "- 留空（推荐）：用配置默认形态，用户没提要求时一律这样；\n"
+            "- voice：语音消息，点开即播；\n"
+            "- file：音频文件，保留原始音质、不受 QQ 语音转码与 60 秒限制。"
+            "**仅当用户本条消息明确说「发文件 / 要无损 / 要好音质」时**才传，"
+            "不要因为「音质更好」就自作主张传 file。\n"
             "调用后会直接把最佳匹配发到当前会话，不会列出候选项让用户选，"
             "因此不要用它做「只是搜一下看看」。"
-            "一次只发一首；返回文本以「已播放」/「已发送文件」开头表示成功。"
+            "一次只发一首。返回文本以「已播放」/「已发送文件」/「已以音乐卡片发送」开头表示成功；\n"
+            "**重要**：若返回文本说「原本要发文件…已改为发送音乐卡片」，说明文件形态失败了，"
+            "实际送达的是音乐卡片。此时必须如实告诉用户收到的是卡片，不要谎称已发文件。"
         ),
         parameters=[
             ToolParameterInfo(
@@ -1289,8 +1388,8 @@ class MusicRequestPlugin(MaiBotPlugin):
                 name="send_as",
                 param_type=ToolParamType.STRING,
                 description=(
-                    "发送形态，默认 voice。voice=语音消息（点开即播）；"
-                    "file=音频文件（保留原始音质，需对方下载，长歌或要好音质时用）"
+                    "一般留空。留空=按插件配置的默认形态发送；"
+                    "仅当用户明确要求「发文件/无损/好音质」时才填 file"
                 ),
                 required=False,
             ),
@@ -1303,21 +1402,45 @@ class MusicRequestPlugin(MaiBotPlugin):
         stream_id = self._extract_stream_id(kwargs)
         self._remember_qq_target(stream_id, kwargs.get("message"))
 
-        keyword = (query or "").strip()
+        # 类型归一：@Tool 参数由 Host 注入，理论上都是 str，但非 str 会让
+        # (query or "").strip() 直接抛 AttributeError（QA 实锤：query=123）。
+        keyword = query.strip() if isinstance(query, str) else ("" if query is None else str(query).strip())
         if not keyword:
             return {"content": "请提供歌曲名或关键词"}
         if not stream_id:
             return {"content": "当前会话缺少 stream_id，无法发送歌曲"}
 
         mode = self._resolve_send_as(send_as)
-        # 代码层兜底：触发消息里明确要「文件/无损/好音质」时强制 file 形态，
-        # 不依赖 LLM 自觉传 send_as（LongCat 实测会漏传）
         trigger_text = self._extract_text(kwargs)
-        if mode != "file" and trigger_text and _RE_FILE_INTENT.search(trigger_text):
+        # 纯占位文本（[voiceurl消息] / [music消息]）是 Host 生成的载荷占位符，
+        # 不含用户表达，按「拿不到触发文本」处理，从而尊重调用方入参
+        if trigger_text and _RE_PLACEHOLDER_ONLY.match(trigger_text.strip()):
+            trigger_text = ""
+        # 代码层兜底（双向）：
+        # 1) 触发消息明确要「文件/无损/好音质」→ 强制 file，
+        #    不依赖 LLM 自觉传 send_as（LongCat 实测会漏传）；
+        # 2) 反过来，LLM 自作主张传了 file、但用户根本没提 → 回落配置默认形态。
+        #    真机实锤（2026-09-12）：用户配置 tool_default_mode=voice，
+        #    只说「放一首万能处方」却收到了文件——模型被工具描述里的「音频文件」诱导了。
+        # 否定/反问语境的过滤在 _has_file_intent 内（逐小句判断）。
+        has_file_intent = _has_file_intent(trigger_text)
+        if mode != "file" and has_file_intent:
             mode = "file"
             self.ctx.logger.info(
                 "触发消息含「发文件」意图，强制 file 形态: %.60s", trigger_text
             )
+        elif mode == "file" and trigger_text and not has_file_intent:
+            fallback = str(self.config.music.tool_default_mode).strip().lower()
+            mode = fallback if fallback in ("voice", "file") else "voice"
+            self.ctx.logger.info(
+                "LLM 传了 send_as=file 但触发消息无此意图，回落默认形态 %s: %.60s",
+                mode, trigger_text,
+            )
+        # 记录形态决策，便于排查「用户没要求却发了文件」这类问题
+        self.ctx.logger.info(
+            "工具形态决策: send_as=%r -> mode=%s（tool_default_mode=%s 意图=%s）",
+            send_as, mode, self.config.music.tool_default_mode, has_file_intent,
+        )
         default = self._resolve_platform("")
         platforms = [default, PLATFORM_QQ if default == PLATFORM_NETEASE else PLATFORM_NETEASE]
         failures: List[str] = []
@@ -1340,10 +1463,9 @@ class MusicRequestPlugin(MaiBotPlugin):
             ranked = self._rank_results(keyword, results)
 
             for song in ranked:
-                if await self._send_song(song, stream_id, silent=True, mode=mode):
-                    if mode == "file":
-                        return {"content": f"已发送文件: {song.display()}"}
-                    return {"content": f"已播放: {song.display()}"}
+                outcome: Dict[str, str] = {}
+                if await self._send_song(song, stream_id, silent=True, mode=mode, outcome=outcome):
+                    return {"content": self._describe_outcome(song, mode, outcome)}
 
         self.ctx.logger.warning("工具点歌全部失败: query=%r 明细=%s", keyword, failures)
         return {

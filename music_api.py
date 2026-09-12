@@ -34,12 +34,14 @@ import httpx
 
 try:  # 包式加载（Runner 的主路径）：命名空间化，避免与别的插件顶层模块撞名
     from .url_parser import (
+        ALLOWED_MUSIC_HOSTS,
         PLATFORM_NETEASE,
         PLATFORM_QQ,
         is_allowed_music_url,
     )
 except ImportError:  # 平铺兜底：脚本直跑 / 测试
     from url_parser import (
+        ALLOWED_MUSIC_HOSTS,
         PLATFORM_NETEASE,
         PLATFORM_QQ,
         is_allowed_music_url,
@@ -52,6 +54,95 @@ REQUEST_TIMEOUT = 10.0
 # NapCat 文件上传超时（秒）：upload_*_file 要等 QQ 完成文件传输，10s 通用超时不够
 # （真机实锤 2026-09-11：私聊文件上传在 10s 处 ReadTimeout，实际需要数十秒）
 NAPCAT_UPLOAD_TIMEOUT = 120.0
+
+
+def normalize_napcat_url(raw: str) -> str:
+    """归一化 NapCat HTTP API 根地址：补协议头 + 去掉路径尾部斜杠。
+
+    两个易错点（真机 + 代码审查实锤）：
+    1. 配置漏写协议头（`127.0.0.1:9999`）→ httpx 抛 UnsupportedProtocol，上传/直连全失败；
+    2. **不能用 `rstrip("/")` 去尾斜杠**——它会把 `"http://"` 吃成 `"http:"`，
+       反而造出非法 URL；协议头判定还必须大小写不敏感（`HTTP://HOST` 是合法写法）。
+    """
+    url = (raw or "").strip()
+    if not url:
+        return ""
+    if not re.match(r"^https?://", url, flags=re.IGNORECASE):
+        url = f"http://{url}"
+    scheme, sep, rest = url.partition("://")
+    if not sep:
+        return url
+    rest = rest.rstrip("/")
+    # 没有主机名的输入（"/"、"///"、"http://"）视为未配置 —— 返回空串让调用方
+    # 走「禁用直连」分支，而不是造出一个指向非法 host 的 client
+    if not rest:
+        return ""
+    return f"{scheme}://{rest}"
+
+
+# 短链跳板域名：只允许在这些域名上发起短链解析请求（防 SSRF 的第一道闸门）。
+# 163cn.tv 是网易云官方短链域名，不在 ALLOWED_MUSIC_HOSTS 里，故单列。
+SHORT_LINK_HOSTS = frozenset({"163cn.tv", "y.qq.com", "i.y.qq.com", "c6.y.qq.com"})
+
+# 内网 / 保留地址字面量（纵深防御；主防线是 host 白名单本身）
+_RE_PRIVATE_HOST = re.compile(
+    r"^(?:localhost|0\.|10\.|127\.|169\.254\.|192\.168\."
+    r"|172\.(?:1[6-9]|2\d|3[01])\.|\[?::1\]?$|\[?fc|\[?fd)",
+    re.IGNORECASE,
+)
+
+# QQ 短链主机带数字前缀（c5 / c6 / c7 …），必须与 url_parser._QQ_SHORT_RE
+# （`c\d+\.y\.qq\.com/base/fcgi-bin/u\?__=`）对齐：白名单只列 c6 会把 c5/c7
+# 这类合法短链静默丢掉（解析得到、却发不出请求），表现为「用户贴了链接没反应」。
+_RE_QQ_SHORT_HOST = re.compile(r"^c\d+\.y\.qq\.com$", re.IGNORECASE)
+
+
+def host_of(url: str) -> str:
+    """取 URL 的 host（小写）；解析失败返回空串。"""
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlparse
+
+        return (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def is_music_host(host: str) -> bool:
+    """host 是否属于音乐服务域名（含 c*.y.qq.com 这类多编号短链主机）。"""
+    h = (host or "").lower()
+    if not h:
+        return False
+    return h in ALLOWED_MUSIC_HOSTS or bool(_RE_QQ_SHORT_HOST.match(h))
+
+
+def is_fetchable_link(url: str) -> bool:
+    """短链解析入口闸门：host 必须在音乐白名单或短链域名内，且非内网字面量。
+
+    旧实现用 `"y.qq.com" in url` 子串判断选 client，`https://evil.com/?x=y.qq.com`
+    这类 URL 能骗过判定，随后带着 QQ 登录态 cookie 去请求攻击者主机。
+    """
+    host = host_of(url)
+    if not host or _RE_PRIVATE_HOST.match(host):
+        return False
+    return is_music_host(host) or host in SHORT_LINK_HOSTS
+
+
+def is_private_host(url: str) -> bool:
+    """目标 host 是否为内网 / 保留地址（字面量判定）。"""
+    host = host_of(url)
+    if not host:
+        return True
+    if _RE_PRIVATE_HOST.match(host):
+        return True
+    try:
+        import ipaddress
+
+        ip = ipaddress.ip_address(host)
+        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+    except ValueError:
+        return False  # 域名形态，交由白名单把关
 
 # 落日志的响应预览长度，避免一个异常响应淹没整个日志
 _PREVIEW_LIMIT = 400
@@ -212,7 +303,7 @@ class MusicSearchClient:
         self._qq_cookie = {
             key: str(value).strip() for key, value in (qq_cookie or {}).items() if value
         }
-        napcat_url = (napcat_url or "").strip().rstrip("/")
+        napcat_url = (napcat_url or "").strip()
 
         netease_cookies = httpx.Cookies()
         if self._netease_cookie.get("MUSIC_U"):
@@ -220,7 +311,15 @@ class MusicSearchClient:
         if self._netease_cookie.get("__csrf"):
             netease_cookies.set("__csrf", self._netease_cookie["__csrf"], domain=".music.163.com", path="/")
 
-        qq_cookies = {key: value for key, value in self._qq_cookie.items() if key in ("uin", "qqmusic_key")}
+        qq_cookies = httpx.Cookies()
+        # 必须逐条 set domain：直接传 dict 会创建「无 domain」cookie，
+        # httpx 会把它附加到该 client 的**所有**请求上——请求一旦指向非腾讯域名，
+        # uin / qqmusic_key 就会被原样送出。与网易云同法限定到 .y.qq.com，
+        # 覆盖 u.y.qq.com（API）、y.qq.com（卡片/Referer）等子域。
+        for _key in ("uin", "qqmusic_key"):
+            _val = self._qq_cookie.get(_key)
+            if _val:
+                qq_cookies.set(_key, _val, domain=".y.qq.com", path="/")
 
         # 搜索与取播放地址必须共用同一个客户端：网易云首次 eapi 请求
         # 依赖搜索响应下发的 NMTID cookie，拆成两个会话会拿不到音频。
@@ -233,24 +332,26 @@ class MusicSearchClient:
         )
         self._napcat: httpx.AsyncClient | None = None
         if napcat_url:
-            # httpx 对无协议头的 URL（如 "127.0.0.1:9999"）会抛 UnsupportedProtocol；
-            # 真机实锤（2026-09-11）：配置漏写 http:// 前缀导致 upload_private_file 直接失败。
-            # 这里做归一化兜底：无协议头自动补 http://，尾斜杠统一去掉。
-            url = napcat_url.strip().rstrip("/")
-            if url and not url.startswith(("http://", "https://")):
-                logger.info("napcat.http_url 缺少协议头，自动补全: %r -> http://%s", napcat_url, url)
-                url = f"http://{url}"
-            headers = {"Content-Type": "application/json"}
-            if napcat_token:
-                headers["Authorization"] = f"Bearer {napcat_token}"
-            self._napcat = httpx.AsyncClient(
-                base_url=url, headers=headers,
-                # 通用超时给非上传动作；上传动作在调用点单独放宽（见 napcat_upload_file）
-                timeout=REQUEST_TIMEOUT,
-            )
-            # 单独放宽上传超时：httpx.AsyncClient 的 per-request timeout 在 AsyncClient 上
-            # 以请求级参数为准，这里存一份供 napcat_upload_file 使用
-            self._napcat_upload_timeout = NAPCAT_UPLOAD_TIMEOUT
+            # 归一化兜底：补协议头、去路径尾斜杠（见 normalize_napcat_url 的注释，
+            # 不要改回 rstrip("/")，它会把 "http://" 吃成 "http:"）
+            url = normalize_napcat_url(napcat_url)
+            if url:
+                if not re.match(r"^https?://", napcat_url, flags=re.IGNORECASE):
+                    logger.info("napcat.http_url 缺少协议头，自动补全: %r -> %s", napcat_url, url)
+                headers = {"Content-Type": "application/json"}
+                if napcat_token:
+                    headers["Authorization"] = f"Bearer {napcat_token}"
+                self._napcat = httpx.AsyncClient(
+                    base_url=url, headers=headers,
+                    # 通用超时给非上传动作；上传动作在调用点单独放宽（见 napcat_upload_file）
+                    timeout=REQUEST_TIMEOUT,
+                )
+                # 单独放宽上传超时：httpx.AsyncClient 的 per-request timeout 在 AsyncClient 上
+                # 以请求级参数为准，这里存一份供 napcat_upload_file 使用
+                self._napcat_upload_timeout = NAPCAT_UPLOAD_TIMEOUT
+            else:
+                # 归一化后拿不到主机名（如 "/"、"http://"）→ 视为未配置，禁用直连
+                logger.warning("napcat.http_url 无有效主机名，直连通道已禁用: %r", napcat_url)
 
     # ---------- 生命周期 ----------
 
@@ -784,32 +885,31 @@ class MusicSearchClient:
     async def resolve_short_url(self, url: str) -> str | None:
         """解析音乐短链，返回白名单内的最终 URL。
 
-        先只看 3xx 的 Location（不下载页面），不行再跟随重定向并从
-        最终 URL / meta refresh / window.location 里提取。任何指向白名单
-        外域名的跳转一律拒绝（防 SSRF）。
+        三层约束（防 SSRF + 防凭据外发）：
+        1. 入口闸门：host 必须在音乐白名单或短链域名内，否则**不发任何请求**；
+        2. 手动逐跳跟随重定向，每一跳都重新校验 host——不能用
+           `follow_redirects=True`，它会在跨主机跳转时继续携带 cookie，
+           一条 302 就能把凭据送到白名单外的站点；
+        3. client 按 host 归属选择，不用子串包含判断。
 
         Args:
-            url: 短链地址。
+            url: 短链地址（用户可控输入）。
 
         Returns:
             最终 URL；失败或目标不在白名单返回 None。
         """
-        client = self._qq if "y.qq.com" in url else self._netease
+        host = host_of(url)
+        if not is_fetchable_link(url) or is_private_host(url):
+            logger.warning("短链入口不在白名单或指向内网，已拒绝请求: %s", url)
+            return None
+        client = self._qq if host.endswith("qq.com") else self._netease
 
         try:
-            resp = await client.get(url, follow_redirects=False)
-            if resp.status_code in (301, 302, 303, 307, 308):
-                location = resp.headers.get("location", "")
-                if location and is_allowed_music_url(location):
-                    return location
-                if location:
-                    logger.warning("短链重定向目标不在白名单，已拒绝: %s", location)
+            resp = await self._get_with_hop_guard(client, url)
         except httpx.HTTPError:
             logger.debug("短链 Location 解析失败: %s", url)
-
-        try:
-            resp = await client.get(url, follow_redirects=True)
-        except httpx.HTTPError:
+            return None
+        if resp is None:
             return None
 
         final_url = str(resp.url)
@@ -831,6 +931,32 @@ class MusicSearchClient:
             return None
 
         logger.warning("短链最终目标不在白名单，已拒绝: %s", final_url)
+        return None
+
+    async def _get_with_hop_guard(
+        self, client: httpx.AsyncClient, url: str, *, max_hops: int = 5
+    ) -> httpx.Response | None:
+        """手动逐跳 GET：每一跳都校验 host 白名单，越界立即中止。
+
+        刻意不用 `follow_redirects=True`：httpx 跟随跨主机重定向时不会剥离
+        无 domain 限定的 cookie，等于给用户可控短链开了一条把凭据送出白名单的路。
+        """
+        current = url
+        for _ in range(max_hops):
+            # 每一跳都必须是白名单主机（音乐域名或短链域名）；跳转链一旦离开
+            # 白名单立刻中止。允许短链主机继续出现在中间跳，是因为 QQ 短链
+            # 会经 c*.y.qq.com 多次中转（5 跳上限兜住环状跳转）。
+            if not is_fetchable_link(current) or is_private_host(current):
+                logger.warning("短链跳转目标不在白名单，已中止: %s", current)
+                return None
+            resp = await client.get(current, follow_redirects=False)
+            if resp.status_code not in (301, 302, 303, 307, 308):
+                return resp
+            location = resp.headers.get("location", "")
+            if not location:
+                return resp
+            current = str(httpx.URL(current).join(location))
+        logger.warning("短链跳转次数超过上限，已中止: %s", url)
         return None
 
     # ---------- NapCat 直连 ----------
