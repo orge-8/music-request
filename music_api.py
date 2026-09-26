@@ -1106,7 +1106,64 @@ class MusicSearchClient:
             )
         return ok, data
 
-    # ---------- 内部工具 ----------
+    async def napcat_send_voice(
+        self,
+        file_path: str,
+        *,
+        group_id: str = "",
+        user_id: str = "",
+    ) -> tuple[bool, dict[str, Any]]:
+        """把本地音频文件作为语音消息发送（NapCat 直连 record 段）。
+
+        为什么不走上层的 voiceurl 通道：那条路吃的是 **URL**，本地磁盘上的
+        文件（本地歌曲库）没有 URL 可给。NapCat 的 record 段接受
+        `file://` URI，直连发送即可绕开这层限制。仅在配置了
+        `napcat.http_url` 时可用，且 `file_path` 必须是 NapCat 进程能读到的路径。
+
+        Args:
+            file_path: NapCat 侧可见的文件路径（转成 file:// URI 发出）。
+            group_id: 群号（与 user_id 二选一）。
+            user_id: QQ号。
+
+        Returns:
+            `(是否成功, NapCat 响应)`。未配置 NapCat、缺目标、请求失败均返回 False。
+        """
+        if self._napcat is None or not file_path:
+            return False, {}
+
+        # file:// URI 拼法：Windows 反斜杠归一成正斜杠；POSIX 绝对路径补第三个斜杠
+        normalized = file_path.replace("\\", "/")
+        if not normalized.startswith("/"):
+            normalized = "/" + normalized
+        uri = "file://" + normalized
+        message = f"[CQ:record,file={uri}]"
+
+        if group_id:
+            path, payload = "/send_group_msg", {"group_id": int(group_id), "message": message}
+        elif user_id:
+            path, payload = "/send_private_msg", {"user_id": int(user_id), "message": message}
+        else:
+            logger.warning("NapCat 发送本地语音缺少目标群号/QQ号")
+            return False, {}
+
+        try:
+            resp = await self._napcat.post(path, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            logger.warning("NapCat 发送本地语音失败: path=%s error=%s", path, type(exc).__name__)
+            return False, {}
+        if not isinstance(data, dict):
+            logger.warning("NapCat 发送本地语音响应异常: path=%s", path)
+            return False, {}
+
+        ok = data.get("status") == "ok" or data.get("retcode") == 0
+        if not ok:
+            logger.warning(
+                "NapCat 发送本地语音业务失败: retcode=%r message=%r wording=%r",
+                data.get("retcode"), data.get("message"), data.get("wording"),
+            )
+        return ok, data
 
     @staticmethod
     def _json(resp: httpx.Response, what: str) -> Any:

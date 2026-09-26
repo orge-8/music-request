@@ -47,6 +47,7 @@ from maibot_sdk.types import (
 
 try:  # 包式加载优先（Runner 主路径）：模块挂到 <插件名>.* 命名空间，避免跨插件重名
     from .audio_cache import AudioCacheError, MusicAudioCache, write_cache_probe
+    from .local_library import PLATFORM_LOCAL, LocalSongLibrary, track_to_song_info_fields
     from .music_api import MusicAPIResponseError, MusicSearchClient, SongInfo
     from .search_rank import rank_songs
     from .url_parser import (
@@ -60,6 +61,7 @@ try:  # 包式加载优先（Runner 主路径）：模块挂到 <插件名>.* �
     )
 except ImportError:  # 平铺兜底：脚本直跑 / 本地测试 / 旧式加载
     from audio_cache import AudioCacheError, MusicAudioCache, write_cache_probe
+    from local_library import PLATFORM_LOCAL, LocalSongLibrary, track_to_song_info_fields
     from music_api import MusicAPIResponseError, MusicSearchClient, SongInfo
     from search_rank import rank_songs
     from url_parser import (
@@ -76,7 +78,7 @@ __plugin_id__ = "github.cateye.music-request"
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_CONFIG_VERSION = "1.4.6"
+SUPPORTED_CONFIG_VERSION = "1.5.0"
 
 # 待选列表的默认有效期（秒）
 _DEFAULT_SELECT_TTL = 300
@@ -289,6 +291,37 @@ class AudioCacheConfig(PluginConfigBase):
     download_timeout_seconds: int = Field(default=30, gt=0, description="下载音频的超时时间（秒）")
 
 
+class LibraryConfig(PluginConfigBase):
+    """本地歌曲库：直接播放磁盘上的音频文件（不经过音乐平台）。"""
+
+    __ui_label__ = "本地歌曲库"
+    __ui_icon__ = "library"
+    __ui_order__ = 6
+
+    enabled: bool = Field(default=False, description="是否启用本地歌曲库")
+    music_dir: str = Field(
+        default="",
+        description="歌曲库目录（MaiBot 侧，递归扫描音频文件），如 D:/Music；留空则禁用",
+    )
+    napcat_dir: str = Field(
+        default="",
+        description="同一目录在 NapCat 进程内的可见路径（Docker 挂载时与上面不同）；留空则与上面相同",
+    )
+    send_mode: Literal["file", "voice"] = Field(
+        default="file",
+        description=(
+            "本地歌曲默认发送形态：file(音频文件，保留原始音质) 或 "
+            "voice(语音消息，受 QQ 转码与 60 秒限制)。均需配置 NapCat HTTP API"
+        ),
+    )
+    refresh_minutes: int = Field(
+        default=10, ge=0, description="索引自动刷新间隔（分钟）；0 = 只在重启/手动刷新时重扫"
+    )
+    search_limit: int = Field(
+        default=10, ge=1, le=30, description="本地库搜索结果数量上限"
+    )
+
+
 class MusicRequestConfig(PluginConfigBase):
     """点歌插件配置。"""
 
@@ -298,6 +331,7 @@ class MusicRequestConfig(PluginConfigBase):
     qq: QQMusicConfig = Field(default_factory=QQMusicConfig)
     napcat: NapCatConfig = Field(default_factory=NapCatConfig)
     cache: AudioCacheConfig = Field(default_factory=AudioCacheConfig)
+    library: LibraryConfig = Field(default_factory=LibraryConfig)
 
 
 # ===== 插件主类 =====
@@ -324,6 +358,10 @@ class MusicRequestPlugin(MaiBotPlugin):
         self._qq_targets: Dict[str, Dict[str, str]] = {}
         # 路径映射失败只提醒一次，避免每条语音都刷屏
         self._map_warned = False
+        # 本地歌曲库：惰性创建；记录创建时的配置指纹，配置变了就重建
+        self._library: Optional[LocalSongLibrary] = None
+        self._library_key: Tuple[str, str, int] = ("", "", -1)
+        self._lib_map_warned = False
 
     # ---------- 基础设施 ----------
 
@@ -458,6 +496,138 @@ class MusicRequestPlugin(MaiBotPlugin):
             except Exception:
                 self.ctx.logger.exception("清理音乐缓存失败")
 
+    # ---------- 本地歌曲库 ----------
+
+    def _get_library(self) -> Optional[LocalSongLibrary]:
+        """获取（惰性创建）本地歌曲库；未启用或未配置目录时返回 None。"""
+        cfg = self.config.library
+        if not cfg.enabled or not (cfg.music_dir or "").strip():
+            return None
+        key = (
+            cfg.music_dir.strip(),
+            cfg.napcat_dir.strip(),
+            int(cfg.refresh_minutes),
+        )
+        if self._library is None or self._library_key != key:
+            self._library = LocalSongLibrary(
+                cfg.music_dir,
+                cfg.napcat_dir,
+                refresh_minutes=int(cfg.refresh_minutes),
+            )
+            self._library_key = key
+        return self._library
+
+    async def _warn_lib_map_once(self, stream_id: str = "", *, silent: bool = True) -> None:
+        """本地库路径映射失败时告警一次（与音频缓存的映射告警相互独立）。"""
+        if self._lib_map_warned:
+            return
+        self._lib_map_warned = True
+        library = self._library
+        self.ctx.logger.warning(
+            "本地歌曲库路径映射失败，NapCat 可能读不到文件: 歌曲目录=%s NapCat目录=%s "
+            "（用 /本地库 核对两目录是否同一份文件）",
+            library.root if library else "?",
+            self.config.library.napcat_dir or "（同歌曲目录）",
+        )
+        if stream_id and not silent:
+            await self.ctx.send.text(
+                "提示：歌曲目录到 NapCat 的路径映射失败，本地歌曲可能发不出去。"
+                "请核对 library.music_dir 与 library.napcat_dir 是否指向同一份文件。",
+                stream_id,
+            )
+
+    async def _send_local(
+        self, song: SongInfo, stream_id: str, *, silent: bool = False,
+        mode: str = "", outcome: Dict[str, str] | None = None,
+    ) -> bool:
+        """发送本地歌曲库里的歌（文件上传或语音，均走 NapCat 直连）。
+
+        本地文件没有 URL，也不经过音频缓存——文件本来就在盘上，只需要把
+        MaiBot 侧路径映射成 NapCat 侧路径。`card` 形态对本地文件无意义
+        （没有平台歌曲 ID 可构卡），传了就回落库配置的 send_mode。
+        """
+        library = self._get_library()
+        if library is None:
+            if outcome is not None:
+                outcome["kind"] = "unavailable"
+                outcome["reason"] = "本地歌曲库未启用"
+            if not silent:
+                await self.ctx.send.text("本地歌曲库未启用，请在插件配置里开启", stream_id)
+            return False
+
+        path = Path(song.song_id)
+        if not path.is_file():
+            self.ctx.logger.warning("本地歌曲文件不存在: %s", path)
+            if outcome is not None:
+                outcome["kind"] = "unavailable"
+                outcome["reason"] = "文件不存在，可能已被移动或删除"
+            if not silent:
+                await self.ctx.send.text(
+                    f"「{song.display()}」的文件不存在，可能已被移动或删除", stream_id
+                )
+            return False
+
+        resolved = (mode or "").strip().lower()
+        if resolved not in ("voice", "file"):
+            resolved = str(self.config.library.send_mode)
+
+        target = await self._resolve_qq_target(stream_id)
+        if target is None:
+            reason = "未配置 NapCat HTTP API 或拿不到群号/QQ号"
+            self.ctx.logger.warning("本地歌曲发送不可用: %s", reason)
+            if outcome is not None:
+                outcome["kind"] = "unavailable"
+                outcome["reason"] = reason
+            if not silent:
+                await self.ctx.send.text(f"本地歌曲发送失败（{reason}）", stream_id)
+            return False
+
+        napcat_path, mapped = library.napcat_path_checked(path)
+        if not mapped:
+            await self._warn_lib_map_once(stream_id, silent=silent)
+
+        display = song.display().strip() or path.stem
+        api = self._get_api()
+        if resolved == "file":
+            file_name = f"{display}{path.suffix}"
+            try:
+                ok, _data = await api.napcat_upload_file(napcat_path, name=file_name, **target)
+            except Exception:
+                self.ctx.logger.exception("NapCat 上传本地歌曲异常: %s", napcat_path)
+                ok = False
+            if ok:
+                self.ctx.logger.info("本地歌曲已作为文件发送: %s（%s）", file_name, napcat_path)
+                if outcome is not None:
+                    outcome["kind"] = "file"
+                    outcome["file_name"] = file_name
+                if not silent:
+                    await self.ctx.send.text(f"已发送文件：{file_name}", stream_id)
+                return True
+            if outcome is not None:
+                outcome["kind"] = "unavailable"
+                outcome["reason"] = "NapCat 上传失败"
+            if not silent:
+                await self.ctx.send.text(f"「{display}」上传失败，请检查 NapCat 日志", stream_id)
+            return False
+
+        # voice：NapCat record 段吃 file:// URI，把本地文件转成语音发出
+        try:
+            ok, _data = await api.napcat_send_voice(napcat_path, **target)
+        except Exception:
+            self.ctx.logger.exception("NapCat 发送本地语音异常: %s", napcat_path)
+            ok = False
+        if ok:
+            self.ctx.logger.info("本地歌曲已作为语音发送: %s（%s）", display, napcat_path)
+            if outcome is not None:
+                outcome["kind"] = "voice"
+            return True
+        if outcome is not None:
+            outcome["kind"] = "unavailable"
+            outcome["reason"] = "NapCat 发送语音失败"
+        if not silent:
+            await self.ctx.send.text(f"「{display}」语音发送失败，请检查 NapCat 日志", stream_id)
+        return False
+
     # ---------- 小工具 ----------
 
     @staticmethod
@@ -560,10 +730,10 @@ class MusicRequestPlugin(MaiBotPlugin):
             )
         return kept
 
-    def _format_results(self, results: List[SongInfo]) -> str:
+    def _format_results(self, results: List[SongInfo], title: str = "搜索结果") -> str:
         """把搜索结果格式化成供用户选歌的列表。"""
         prefix = self.config.music.command_prefix
-        lines = ["🎵 搜索结果："]
+        lines = [f"🎵 {title}："]
         for index, song in enumerate(results, 1):
             artist = f" - {song.artists}" if song.artists else ""
             album = f" 《{song.album}》" if song.album else ""
@@ -920,6 +1090,9 @@ class MusicRequestPlugin(MaiBotPlugin):
         看到「已发送文件」而用户实际收到卡片）。
         """
         resolved = (mode or str(self.config.music.play_mode)).strip().lower()
+        if song.platform == PLATFORM_LOCAL:
+            # 本地歌曲库：card 无意义，形态由 _send_local 内部回落 library.send_mode
+            return await self._send_local(song, stream_id, silent=silent, mode=mode, outcome=outcome)
         if resolved == "file":
             return await self._send_file(song, stream_id, silent=silent, outcome=outcome)
         if outcome is not None:
@@ -1071,7 +1244,7 @@ class MusicRequestPlugin(MaiBotPlugin):
         # 行为自检：把生效配置打进启动日志，真机排障时一眼可见
         self.ctx.logger.info(
             "点歌插件已加载 version=%s enabled=%s platform=%s mode=%s voice_source=%s "
-            "prefix=%s 网易云登录=%s QQ音乐登录=%s NapCat直连=%s",
+            "prefix=%s 网易云登录=%s QQ音乐登录=%s NapCat直连=%s 本地歌曲库=%s",
             SUPPORTED_CONFIG_VERSION,
             self.config.plugin.enabled,
             self.config.music.default_platform,
@@ -1081,6 +1254,7 @@ class MusicRequestPlugin(MaiBotPlugin):
             bool(self.config.netease.music_u),
             bool(self.config.qq.uin and self.config.qq.qqmusic_key),
             bool(self.config.napcat.http_url),
+            bool(self._get_library()),
         )
 
     async def on_unload(self) -> None:
@@ -1091,6 +1265,8 @@ class MusicRequestPlugin(MaiBotPlugin):
             self._api = None
         self._pending.clear()
         self._qq_targets.clear()
+        self._library = None
+        self._library_key = ("", "", -1)
         self.ctx.logger.info("点歌插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: Dict[str, Any], version: str) -> None:
@@ -1110,6 +1286,10 @@ class MusicRequestPlugin(MaiBotPlugin):
         # 映射告警去重标记随配置重置：改完缓存/NapCat 路径后应重新提示一次，
         # 否则用户修完配置也看不到核对提示
         self._map_warned = False
+        # 本地歌曲库随配置重建（目录/NapCat 目录/刷新间隔任一变了都会换实例）
+        self._library = None
+        self._library_key = ("", "", -1)
+        self._lib_map_warned = False
 
     # ---------- @Command ----------
 
@@ -1245,6 +1425,12 @@ class MusicRequestPlugin(MaiBotPlugin):
             ))
         else:
             lines.append("音频缓存: 未启用")
+        # 本地歌曲库（触发惰性扫描；状态命令是显式操作，扫一次可接受）
+        library = self._get_library()
+        if library is not None:
+            lines.extend(library.summary_lines())
+        else:
+            lines.append("本地歌曲库: 未启用")
         lines.append(f"待选列表: {len(self._pending)} 个会话")
 
         text = "\n".join(lines)
@@ -1320,6 +1506,85 @@ class MusicRequestPlugin(MaiBotPlugin):
         ]
 
         text = "\n".join(lines)
+        sent = bool(await self.ctx.send.text(text, stream_id))
+        return sent, text, 2 if sent else 0
+
+    @Command(
+        "本地歌",
+        description="播放本地歌曲库里的歌，用法 /本地歌 <关键词>",
+        pattern=_PFX + r"\s*本地歌(?:\s+(?P<query>.+?))?\s*$",
+    )
+    async def cmd_本地歌(
+        self, matched_groups: Optional[Dict[str, str]] = None, **kwargs: Any
+    ) -> Tuple[bool, str, int]:
+        """处理 `/本地歌` 命令：搜本地库，单首直发、多首列候选。"""
+        groups = matched_groups if isinstance(matched_groups, dict) else {}
+        if not self._prefix_ok(str(groups.get("pfx") or "")):
+            return False, "", 0
+
+        stream_id = self._extract_stream_id(kwargs)
+        self._remember_qq_target(stream_id, kwargs.get("message"))
+
+        library = self._get_library()
+        if library is None:
+            message = "本地歌曲库未启用，请在插件配置里开启 library.enabled 并配置歌曲目录"
+            await self.ctx.send.text(message, stream_id)
+            return False, message, 0
+
+        query = str(groups.get("query") or "").strip()
+        if not query:
+            match = re.search(
+                re.escape(str(self.config.music.command_prefix)) + r"\s*本地歌\s*(?P<query>.+)$",
+                self._extract_text(kwargs),
+            )
+            query = (match.group("query") or "").strip() if match else ""
+        if not query:
+            message = f"用法：{self.config.music.command_prefix}本地歌 <关键词>"
+            await self.ctx.send.text(message, stream_id)
+            return False, "缺少关键词", 0
+
+        tracks = library.search(query, limit=int(self.config.library.search_limit))
+        if not tracks:
+            message = f"本地歌曲库里没有找到「{query}」"
+            await self.ctx.send.text(message, stream_id)
+            return False, message, 2
+
+        songs = [SongInfo(**track_to_song_info_fields(track)) for track in tracks]
+        if len(songs) == 1 or self.config.music.auto_select_first:
+            song = songs[0]
+            sent = await self._send_song(song, stream_id)
+            return sent, f"已发送本地歌曲: {song.display()}" if sent else f"发送失败: {song.display()}", 2
+
+        self._remember_pending(stream_id, songs, PLATFORM_LOCAL)
+        await self.ctx.send.text(self._format_results(songs, "本地歌曲库"), stream_id)
+        return True, f"本地库找到 {len(songs)} 首，已列出候选", 2
+
+    @Command(
+        "本地库",
+        description="查看本地歌曲库状态，用法 /本地库 [刷新]",
+        pattern=_PFX + r"\s*本地库(?:\s+(?P<action>刷新|rescan))?\s*$",
+    )
+    async def cmd_本地库(
+        self, matched_groups: Optional[Dict[str, str]] = None, **kwargs: Any
+    ) -> Tuple[bool, str, int]:
+        """处理 `/本地库` 命令：查看状态或强制重建索引。"""
+        groups = matched_groups if isinstance(matched_groups, dict) else {}
+        if not self._prefix_ok(str(groups.get("pfx") or "")):
+            return False, "", 0
+
+        stream_id = self._extract_stream_id(kwargs)
+        library = self._get_library()
+        if library is None:
+            text = "本地歌曲库未启用，请在插件配置里开启 library.enabled 并配置歌曲目录"
+            sent = bool(await self.ctx.send.text(text, stream_id))
+            return sent, text, 2 if sent else 0
+
+        action = str(groups.get("action") or "").strip().lower()
+        if action == "刷新":
+            count = library.rescan()
+            text = f"🔄 本地歌曲库索引已重建：{count} 首"
+        else:
+            text = "\n".join(["🎧 本地歌曲库状态", *library.summary_lines()])
         sent = bool(await self.ctx.send.text(text, stream_id))
         return sent, text, 2 if sent else 0
 
@@ -1473,6 +1738,83 @@ class MusicRequestPlugin(MaiBotPlugin):
                 f"已在网易云音乐和QQ音乐搜索「{keyword}」，均未取到可播放音频。"
                 "请不要重复调用本工具，直接告知用户当前无法播放即可。"
             )
+        }
+
+    @Tool(
+        "play_local_music",
+        description=(
+            "播放本地歌曲库（磁盘音频文件）里的歌。"
+            "仅当用户明确想听本地/离线歌曲库里的歌时使用（如「从本地库放一首」「放本地的夜曲」）；"
+            "普通点歌请用 search_and_play_music。"
+            "返回文本以「已发送文件」/「已播放本地歌曲」开头表示成功；失败时不要重复调用。"
+        ),
+        detailed_description=(
+            "参数 query 为歌名或「歌名 歌手」关键词，只在本机歌曲库目录内匹配，"
+            "搜不到网络平台上的歌。\n"
+            "参数 send_as：留空时按库配置的默认形态发送（通常为音频文件，保留原始音质）；"
+            "voice = 语音消息。本地文件构不了音乐卡片，不要传 card。\n"
+            "发送需要 NapCat HTTP API 可用；失败原因会写在返回文本里。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="query",
+                param_type=ToolParamType.STRING,
+                description="歌名或「歌名 歌手」关键词（只匹配本地库文件名）",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="send_as",
+                param_type=ToolParamType.STRING,
+                description="一般留空。留空=按库配置默认形态；voice=语音消息。不要传 card",
+                required=False,
+            ),
+        ],
+    )
+    async def play_local_music(
+        self, query: str = "", send_as: str = "", **kwargs: Any
+    ) -> Dict[str, Any]:
+        """LLM 播放本地歌曲：库内搜索最佳匹配并直发。"""
+        stream_id = self._extract_stream_id(kwargs)
+        self._remember_qq_target(stream_id, kwargs.get("message"))
+
+        keyword = query.strip() if isinstance(query, str) else ("" if query is None else str(query).strip())
+        if not keyword:
+            return {"content": "请提供歌名或关键词"}
+        if not stream_id:
+            return {"content": "当前会话缺少 stream_id，无法发送歌曲"}
+
+        library = self._get_library()
+        if library is None:
+            return {
+                "content": "本地歌曲库未启用。请告知用户需要在插件配置里开启本地歌曲库并配置歌曲目录。"
+            }
+
+        tracks = library.search(keyword, limit=int(self.config.library.search_limit))
+        if not tracks:
+            return {
+                "content": f"本地歌曲库里没有找到「{keyword}」。请不要重复调用本工具，"
+                "可改用普通点歌（search_and_play_music）从音乐平台搜索。"
+            }
+
+        # send_as 归一：本地文件构不了卡片；留空时用库配置形态（默认 file 保真）
+        requested = send_as.strip().lower() if isinstance(send_as, str) else ""
+        mode = requested if requested in ("file", "voice") else str(self.config.library.send_mode)
+        self.ctx.logger.info(
+            "本地库工具形态决策: send_as=%r -> mode=%s", send_as, mode
+        )
+
+        song = SongInfo(**track_to_song_info_fields(tracks[0]))
+        outcome: Dict[str, str] = {}
+        sent = await self._send_song(song, stream_id, silent=True, mode=mode, outcome=outcome)
+        if sent:
+            kind = outcome.get("kind") or mode
+            if kind == "file":
+                return {"content": f"已发送文件: {song.display()}（来自本地歌曲库）"}
+            return {"content": f"已播放本地歌曲: {song.display()}"}
+        reason = outcome.get("reason") or "发送失败"
+        return {
+            "content": f"本地歌曲「{song.display()}」发送失败（{reason}）。"
+            "不要重复调用本工具，直接告知用户即可。"
         }
 
     # ---------- @HookHandler ----------

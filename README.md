@@ -21,12 +21,14 @@ MaiBot 插件：搜索点歌、解析音乐链接与分享卡片，把歌曲以*
   LLM 点歌时可用 `send_as` 参数二选一，默认发语音。
 - **状态自检**：`/点歌状态` 一眼看清配置是否生效、平台可用性、缓存用量；
   `/点歌自检` 写探针文件核对缓存目录与 NapCat 是否指向同一份文件。
+- **本地歌曲库**（v1.5.0）：直接播放磁盘上的音频文件（MP3/FLAC/M4A/APE 等），
+  `/本地歌 <关键词>` 搜索、`/本地库` 查看状态；LLM 可经 `play_local_music` 工具点播本地歌。
 
 ## 安装
 
 1. 把整个 `music-request/` 目录放进 MaiBot 的 `plugins/` 下。
 2. 启动 / 重启 MaiBot，观察加载日志里的一行自检：
-   `点歌插件已加载 version=1.4.0 enabled=True platform=163 mode=card …`
+   `点歌插件已加载 version=1.5.0 enabled=True platform=163 mode=card …`
 3. 在 WebUI（`http://127.0.0.1:8001`）插件管理中确认插件出现并启用，
    或在配置里设 `[plugin] enabled = true`。
 
@@ -59,6 +61,12 @@ MaiBot 插件：搜索点歌、解析音乐链接与分享卡片，把歌曲以*
 | `[cache]` | `napcat_dir` | `""` | 同一目录在 NapCat 进程内的路径，留空同上 |
 | `[cache]` | `max_size_mb` / `expire_hours` / `cleanup_interval_hours` | `1024` / `24` / `24` | 容量上限、过期阈值、清理间隔 |
 | `[cache]` | `max_file_size_mb` / `download_timeout_seconds` | `50` / `30` | 单文件上限、下载超时 |
+| `[library]` | `enabled` | `false` | 是否启用本地歌曲库 |
+| `[library]` | `music_dir` | `""` | 歌曲库目录（MaiBot 侧，递归扫描音频文件） |
+| `[library]` | `napcat_dir` | `""` | 同一目录在 NapCat 进程内的路径（Docker 挂载时与上面不同），留空同上 |
+| `[library]` | `send_mode` | `"file"` | 本地歌曲发送形态：`file` 音频文件（保真）/ `voice` 语音（受 QQ 转码与 60 秒限制） |
+| `[library]` | `refresh_minutes` | `10` | 索引自动刷新间隔（分钟），`0` = 只在重启/`/本地库 刷新` 时重扫 |
+| `[library]` | `search_limit` | `10` | 本地库搜索结果数量上限 |
 
 ### Cookie 怎么拿
 
@@ -204,6 +212,8 @@ MaiBot 适配器对 `music` 段只按固定结构处理（`platform` + `id`）�
 | `{pfx}选歌 <序号>` | 从候选里选一首 | `/选歌 1` |
 | `{pfx}点歌状态` | 查看运行状态与自检信息 | `/点歌状态` |
 | `{pfx}点歌自检` | 核对缓存目录与 NapCat 是否指向同一份文件 | `/点歌自检` |
+| `{pfx}本地歌 <关键词>` | 搜本地歌曲库并播放，多首命中时列候选 | `/本地歌 夜曲` |
+| `{pfx}本地库 [刷新]` | 查看本地歌曲库状态；`刷新` 强制重建索引 | `/本地库` |
 
 `{pfx}` 为 `[music] command_prefix`，默认 `/`。命令要求前缀匹配：配了 `/` 时 `#点歌` 不会被处理
 （也不会拦截消息）。全角 `／` 会归一化成 `/`。
@@ -243,6 +253,32 @@ NapCat 目录: /app/music_cache
 探针文件以 `.probe_` 开头，不参与 `*.mp3` 的过期与容量清理，核对完可手动删除。
 `/点歌状态` 只在两目录字面相同时标注「两目录相同」，字面不同不代表有问题
 （Docker 挂载就是典型的不同路径指同一份文件）——所以最终仍以摘要比对为准。
+
+## 本地歌曲库（v1.5.0）
+
+把磁盘上的音频文件直接当歌放：不经过音乐平台、不吃版权限制、**文件形态保留原始音质**。
+
+```toml
+[library]
+enabled = true
+music_dir = "D:/Music"        # MaiBot 侧目录，递归扫描
+napcat_dir = ""               # NapCat 侧路径（Docker 挂载时必配）
+send_mode = "file"            # file = 音频文件（推荐）/ voice = 语音
+```
+
+- **搜索口径**：按文件名匹配（不含扩展名），整串命中 > 全部关键词命中 > 部分命中；
+  「歌名 歌手」与「歌手 歌名」都能命中。命中多首时与平台点歌一样列候选，用 `/选歌 <序号>` 选。
+- **发送通道**：本地文件没有 URL，走 **NapCat HTTP 直连**——`file` 形态调
+  `upload_group_file` / `upload_private_file`，`voice` 形态发 `CQ:record`（file:// URI）。
+  因此 `[napcat] http_url` 必须配置，且群聊/私聊目标能从消息或聊天流反查到。
+- **路径映射**：与音频缓存同一套逻辑。Docker 部署时把 `napcat_dir` 配成容器内路径，
+  可用 `/点歌自检` 的思路核对两个目录是否同一份文件。
+- **索引刷新**：目录 mtime 变化且超过 `refresh_minutes` 时自动重扫；
+  大批量增删歌后可 `/本地库 刷新` 立即重建。
+- **LLM 点播**：`play_local_music` 工具——用户明确说「放本地库的歌」时触发；
+  与联网点歌工具相互独立，普通点歌仍走平台搜索。
+- **局限**：本地文件构不了音乐卡片；语音形态会受 QQ 转码（SILK）与 60 秒上限影响，
+  想听完整音质请保持 `send_mode = "file"`。
 
 ## 与歌词识别插件联动（cv_lyric_context）
 
@@ -351,8 +387,9 @@ python check_plugin.py --plugin .
 # FakeHost 冒烟（不启 MaiBot，用离线替身挡网络）
 python tests/smoke_test.py
 
-# 单元测试（291 项：链接/卡片解析、相关度排序与过滤、组件绑定、命令正则、
+# 单元测试（321 项：链接/卡片解析、相关度排序与过滤、组件绑定、命令正则、
 #          配置模型、CQ 转义、eapi 加密、路径映射与探针、形态兜底与否定语境、
+#          本地歌曲库（扫描/搜索/映射/命令/工具）、
 #          凭据不外发 / 短链白名单 / 逐跳重定向校验等安全回归）
 python -m pytest -q tests
 

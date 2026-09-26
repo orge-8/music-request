@@ -82,12 +82,13 @@ def test_manifest_declares_cryptography_dependency(manifest: dict) -> None:
 # ---------- 组件绑定（装饰器绑错方法的唯一本地防线） ----------
 
 
-def test_get_components_exposes_all_six() -> None:
+def test_get_components_exposes_all_nine() -> None:
     """覆盖 Runner 注册链路：漏调 super().__init__() 时这里会 AttributeError。"""
     components = MusicRequestPlugin().get_components()
     names = {item["name"] for item in components}
     assert names == {
-        "点歌", "选歌", "点歌状态", "点歌自检", "search_and_play_music", "parse_music_link",
+        "点歌", "选歌", "点歌状态", "点歌自检", "本地歌", "本地库",
+        "search_and_play_music", "play_local_music", "parse_music_link",
     }, names
 
 
@@ -239,10 +240,13 @@ def test_all_config_fields_have_defaults() -> None:
     """任何字段缺默认值都会让 Runner 无法生成默认配置。"""
     config = plugin_module.MusicRequestConfig()
     dumped = config.model_dump()
-    assert set(dumped) == {"plugin", "music", "netease", "qq", "napcat", "cache"}
+    assert set(dumped) == {"plugin", "music", "netease", "qq", "napcat", "cache", "library"}
     assert dumped["music"]["play_mode"] == "card"
     assert dumped["music"]["voice_source"] == "local"
     assert dumped["music"]["command_prefix"] == "/"
+    # 本地歌曲库默认关闭：不配置不应影响既有行为
+    assert dumped["library"]["enabled"] is False
+    assert dumped["library"]["send_mode"] == "file"
 
 
 @pytest.mark.parametrize(("field", "bad"), [("play_mode", "video"), ("voice_source", "cloud")])

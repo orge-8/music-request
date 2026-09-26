@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "github.cateye.music-request",
-  "version": "1.4.6",
+  "version": "1.5.0",
   "name": "点歌插件",
-  "description": "搜索点歌、解析音乐链接与分享卡片，发送语音音频或音乐卡片，支持网易云音乐与QQ音乐。搜索结果按相关度排序并做相对过滤，避免最佳匹配因版权不可播时改播无关歌曲。",
+  "description": "搜索点歌、解析音乐链接与分享卡片，发送语音音频或音乐卡片，支持网易云音乐与QQ音乐；可启用本地歌曲库，直接播放磁盘上的音频文件（文件上传或语音）。搜索结果按相关度排序并做相对过滤，避免最佳匹配因版权不可播时改播无关歌曲。",
   "author": {
     "name": "cateye",
     "url": "https://github.com/cateye"

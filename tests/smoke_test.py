@@ -27,6 +27,8 @@ class StubAPI:
     def __init__(self, songs) -> None:
         self._songs = list(songs)
         self.closed = False
+        self.uploads = []
+        self.voices = []
 
     async def search(self, query, platform, limit=5):
         return self._songs[:limit]
@@ -58,6 +60,14 @@ class StubAPI:
 
     async def napcat_send_message(self, message, *, group_id="", user_id=""):
         return False, {}
+
+    async def napcat_upload_file(self, file_path, *, name="", group_id="", user_id=""):
+        self.uploads.append({"file_path": file_path, "name": name, "user_id": user_id})
+        return True, {"status": "ok"}
+
+    async def napcat_send_voice(self, file_path, *, group_id="", user_id=""):
+        self.voices.append(file_path)
+        return True, {"status": "ok"}
 
     async def close(self):
         self.closed = True
@@ -111,7 +121,9 @@ def main() -> int:
         # 组件注册链路：唯一能在本地覆盖 Runner 注册的手段
         names = {item["name"] for item in plugin.get_components()}
         assert names == {
-            "点歌", "选歌", "点歌状态", "点歌自检", "search_and_play_music", "parse_music_link",
+            "点歌", "选歌", "点歌状态", "点歌自检",
+            "本地歌", "本地库",
+            "search_and_play_music", "play_local_music", "parse_music_link",
         }, f"组件集合异常: {names}"
 
         plugin._api = StubAPI(songs)  # 挡掉网络
@@ -172,6 +184,47 @@ def main() -> int:
         result = await plugin.search_and_play_music(query="测试歌曲", stream_id="fake-stream")
         assert "测试歌曲" in result.get("content", ""), f"未播最佳匹配: {result}"
         assert "嘘嘘声" not in result.get("content", ""), f"播出了无关候选: {result}"
+
+        # ── 本地歌曲库：状态、搜索列候选、选歌发文件、工具直发 ──
+        # 库默认关闭；这里临时开一个指向临时目录的库验证端到端编排
+        import tempfile
+
+        tmp_root = pathlib.Path(tempfile.mkdtemp(prefix="mr-smoke-local-lib"))
+        lib_dir = tmp_root / "music"
+        lib_dir.mkdir()
+        (lib_dir / "夜曲.flac").write_bytes(b"local-a")
+        (lib_dir / "夜曲 (Live).mp3").write_bytes(b"local-b")
+        (lib_dir / "晴天.flac").write_bytes(b"local-c")
+
+        config["library"]["enabled"] = True
+        config["library"]["music_dir"] = str(lib_dir)
+        config["library"]["send_mode"] = "file"
+        plugin.set_plugin_config(config)
+        stub = plugin._api
+
+        ok, _resp, _level = await plugin.cmd_本地库(matched_groups={"pfx": "/"}, stream_id="fake-stream")
+        assert ok is True and "3 首" in (host.sent_texts[-1] or ""), "本地库状态输出异常"
+
+        # 多首命中 → 列候选（与平台点歌共用 /选歌 机制）
+        ok, _resp, level = await plugin.cmd_本地歌(
+            matched_groups={"pfx": "/", "query": "夜曲"},
+            stream_id="fake-stream",
+            message={"platform": "qq", "message_info": {"user_info": {"user_id": "10001"}}},
+        )
+        assert ok is True and "选歌" in (host.sent_texts[-1] or ""), "本地歌未列出候选"
+        assert not stub.uploads, "列候选阶段不应发文件"
+
+        ok, _resp, _level = await plugin.cmd_选歌(matched_groups={"pfx": "/", "index": "1"}, stream_id="fake-stream")
+        assert ok is True and len(stub.uploads) == 1 and stub.uploads[0]["name"] == "夜曲.flac", (
+            f"选歌未发本地文件: {stub.uploads}"
+        )
+
+        # 工具直发单首命中（send_as 留空 → 库配置 file 形态）
+        result = await plugin.play_local_music(query="晴天", stream_id="fake-stream")
+        assert result.get("content", "").startswith("已发送文件"), f"本地库工具返回异常: {result}"
+        assert len(stub.uploads) == 2, stub.uploads
+
+        plugin.set_plugin_config({**config, "library": {**config["library"], "enabled": False}})
 
         # ── Hook：音乐链接 → 发送并拦截 ──
         hook_result = await plugin.parse_music_link(
