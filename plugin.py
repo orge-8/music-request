@@ -47,7 +47,12 @@ from maibot_sdk.types import (
 
 try:  # 包式加载优先（Runner 主路径）：模块挂到 <插件名>.* 命名空间，避免跨插件重名
     from .audio_cache import AudioCacheError, MusicAudioCache, write_cache_probe
-    from .local_library import PLATFORM_LOCAL, LocalSongLibrary, track_to_song_info_fields
+    from .local_library import (
+        PLATFORM_LOCAL,
+        LocalSongLibrary,
+        keyword_tokens,
+        track_to_song_info_fields,
+    )
     from .music_api import MusicAPIResponseError, MusicSearchClient, SongInfo
     from .search_rank import rank_songs
     from .url_parser import (
@@ -61,7 +66,12 @@ try:  # 包式加载优先（Runner 主路径）：模块挂到 <插件名>.* �
     )
 except ImportError:  # 平铺兜底：脚本直跑 / 本地测试 / 旧式加载
     from audio_cache import AudioCacheError, MusicAudioCache, write_cache_probe
-    from local_library import PLATFORM_LOCAL, LocalSongLibrary, track_to_song_info_fields
+    from local_library import (
+        PLATFORM_LOCAL,
+        LocalSongLibrary,
+        keyword_tokens,
+        track_to_song_info_fields,
+    )
     from music_api import MusicAPIResponseError, MusicSearchClient, SongInfo
     from search_rank import rank_songs
     from url_parser import (
@@ -314,6 +324,14 @@ class LibraryConfig(PluginConfigBase):
             "voice(语音消息，受 QQ 转码与 60 秒限制)。均需配置 NapCat HTTP API"
         ),
     )
+    tool_prefer_local: bool = Field(
+        default=True,
+        description=(
+            "LLM 点歌工具(search_and_play_music)优先查本地歌曲库："
+            "库开着且关键词强匹配（整串或全部关键词命中文件名）时直接发本地文件，"
+            "未命中或发送失败再走音乐平台"
+        ),
+    )
     refresh_minutes: int = Field(
         default=10, ge=0, description="索引自动刷新间隔（分钟）；0 = 只在重启/手动刷新时重扫"
     )
@@ -516,6 +534,24 @@ class MusicRequestPlugin(MaiBotPlugin):
             )
             self._library_key = key
         return self._library
+
+    @staticmethod
+    def _local_strong_match(keyword: str, track_name: str) -> bool:
+        """本地库命中是否「强匹配」：整串命中，或全部关键词都命中文件名。
+
+        门槛刻意比平台搜索高：本地文件名是唯一的判定依据，弱命中（只沾一个
+        关键词）时宁可去平台搜，也不要重蹈「放错歌」的覆辙。
+        """
+        text = (keyword or "").strip().lower()
+        if not text:
+            return False
+        name = (track_name or "").strip().lower()
+        if not name:
+            return False
+        if text in name:
+            return True
+        tokens = keyword_tokens(text)
+        return bool(tokens) and all(token in name for token in tokens)
 
     async def _warn_lib_map_once(self, stream_id: str = "", *, silent: bool = True) -> None:
         """本地库路径映射失败时告警一次（与音频缓存的映射告警相互独立）。"""
@@ -1624,6 +1660,8 @@ class MusicRequestPlugin(MaiBotPlugin):
             "**默认不要传 send_as**，插件会按配置的默认形态发送；"
             "只有用户本条消息里明确要求「发文件 / 无损 / 要好音质」时才传 send_as=file。"
             "不要指定平台，插件会自动选可用平台并逐首尝试候选。"
+            "若启用了本地歌曲库，本工具会优先在本地库里找（返回文本带「来自本地歌曲库」标记），"
+            "没命中再搜音乐平台。\n"
             "本工具已内置换源与重试；若返回播放失败，不要重复调用，直接告诉用户即可。"
         ),
         detailed_description=(
@@ -1706,6 +1744,39 @@ class MusicRequestPlugin(MaiBotPlugin):
             "工具形态决策: send_as=%r -> mode=%s（tool_default_mode=%s 意图=%s）",
             send_as, mode, self.config.music.tool_default_mode, has_file_intent,
         )
+
+        # ── 本地歌曲库优先 ──
+        # 库开着且开了 tool_prefer_local、关键词强匹配时直接发本地文件；
+        # 未命中或发送失败（如 NapCat 不可用）都继续走下面的平台搜索，不留死路。
+        library = self._get_library()
+        if library is not None and self.config.library.tool_prefer_local:
+            tracks = library.search(keyword, limit=1)
+            if tracks and self._local_strong_match(keyword, tracks[0].name):
+                # 本地形态决策：显式 send_as > 「发文件」意图 > 库配置 send_mode。
+                # 全局 tool_default_mode（默认 voice）不适用于本地文件——
+                # 语音会打到 SILK 音质，库配置 file 的本意就是保真。
+                requested = send_as.strip().lower() if isinstance(send_as, str) else ""
+                explicit = requested if requested in ("file", "voice") else ""
+                local_mode = explicit or ("file" if has_file_intent else str(self.config.library.send_mode))
+                local_song = SongInfo(**track_to_song_info_fields(tracks[0]))
+                local_outcome: Dict[str, str] = {}
+                if await self._send_song(
+                    local_song, stream_id, silent=True, mode=local_mode, outcome=local_outcome
+                ):
+                    kind = local_outcome.get("kind") or local_mode
+                    self.ctx.logger.info(
+                        "本地歌曲库优先命中并发送: %s（%s）", local_song.display(), kind
+                    )
+                    if kind == "file":
+                        return {
+                            "content": f"已发送文件: {local_song.display()}（来自本地歌曲库）"
+                        }
+                    return {"content": f"已播放: {local_song.display()}（来自本地歌曲库）"}
+                self.ctx.logger.warning(
+                    "本地库命中但发送失败，转平台搜索: %s（原因=%s）",
+                    tracks[0].name, local_outcome.get("reason", "未知"),
+                )
+
         default = self._resolve_platform("")
         platforms = [default, PLATFORM_QQ if default == PLATFORM_NETEASE else PLATFORM_NETEASE]
         failures: List[str] = []

@@ -395,8 +395,139 @@ def test_tool_local_voice_failure_honest_report(tmp_path: pathlib.Path) -> None:
     assert "不要重复调用" in result["content"], result
 
 
-# ---------- music_api.napcat_send_voice（真实 CQ 构造） ----------
+# ---------- search_and_play_music 本地库优先 ----------
 
+
+class _PlatformStubAPI(_LocalStubAPI):
+    """在本地库替身之上加平台搜索记录：验证「本地优先，未命中才走平台」。"""
+
+    def __init__(self, songs=(), **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._songs = list(songs)
+        self.search_calls: list[tuple] = []
+
+    async def search(self, query, platform, limit=5):
+        self.search_calls.append((query, platform))
+        return self._songs[:limit]
+
+    async def get_song_url(self, song_id, platform, media_id="", *, mp3_only=False):
+        return "https://example.invalid/x.mp3"
+
+
+def _disable_local_preference(plugin) -> None:
+    config = plugin.config.model_dump()
+    config["library"]["tool_prefer_local"] = False
+    plugin.set_plugin_config(config)
+
+
+def test_tool_search_prefers_local_on_strong_match(tmp_path: pathlib.Path) -> None:
+    """强匹配（整串命中）→ 直接发本地文件，不查平台。"""
+    plugin, host, music_dir = _prepare_plugin_with_library(tmp_path)
+    make_files(music_dir, ["夜曲.flac"])
+    stub = _PlatformStubAPI()
+    plugin._api = stub
+
+    result = asyncio.run(
+        plugin.search_and_play_music(query="夜曲", stream_id="s1", message=_qq_message())
+    )
+
+    assert result["content"].startswith("已发送文件"), result
+    assert "来自本地歌曲库" in result["content"], result
+    assert len(stub.uploads) == 1 and stub.uploads[0]["name"] == "夜曲.flac", stub.uploads
+    assert stub.search_calls == [], "本地命中时不应再查平台"
+    assert not host.calls_of("send.custom"), "不应发平台卡片"
+
+
+def test_tool_search_falls_to_platform_without_local_match(tmp_path: pathlib.Path) -> None:
+    plugin, host, music_dir = _prepare_plugin_with_library(tmp_path)
+    make_files(music_dir, ["夜曲.flac"])
+    from plugin import SongInfo
+
+    stub = _PlatformStubAPI([SongInfo(song_id="1", name="晴天", artists="周杰伦", platform="163")])
+    plugin._api = stub
+
+    result = asyncio.run(
+        plugin.search_and_play_music(query="晴天", stream_id="s1", message=_qq_message())
+    )
+
+    assert "已播放" in result["content"], result
+    assert "来自本地歌曲库" not in result["content"], "平台结果不应带本地库标记"
+    assert len(stub.search_calls) >= 1, "未命中本地库时应查平台"
+    assert not stub.uploads, "平台路径不应触发本地上传"
+
+
+def test_tool_search_ignores_weak_local_match(tmp_path: pathlib.Path) -> None:
+    """弱命中（关键词只沾一个）必须跳过本地库去平台——防「放错歌」。"""
+    plugin, host, music_dir = _prepare_plugin_with_library(tmp_path)
+    make_files(music_dir, ["夜曲.flac"])  # 「夜曲 周杰伦」的「周杰伦」不在文件名里
+    from plugin import SongInfo
+
+    stub = _PlatformStubAPI([SongInfo(song_id="1", name="夜曲", artists="周杰伦", platform="163")])
+    plugin._api = stub
+
+    result = asyncio.run(
+        plugin.search_and_play_music(query="夜曲 周杰伦", stream_id="s1", message=_qq_message())
+    )
+
+    assert len(stub.search_calls) >= 1, "弱命中应转平台搜索"
+    assert not stub.uploads, "弱命中不应发本地文件"
+
+
+def test_tool_search_tool_prefer_local_off(tmp_path: pathlib.Path) -> None:
+    plugin, host, music_dir = _prepare_plugin_with_library(tmp_path)
+    make_files(music_dir, ["夜曲.flac"])
+    from plugin import SongInfo
+
+    _disable_local_preference(plugin)
+    stub = _PlatformStubAPI([SongInfo(song_id="1", name="夜曲", platform="163")])
+    plugin._api = stub
+
+    result = asyncio.run(
+        plugin.search_and_play_music(query="夜曲", stream_id="s1", message=_qq_message())
+    )
+
+    assert len(stub.search_calls) >= 1, "关闭优先开关时应直接走平台"
+    assert not stub.uploads
+
+
+def test_tool_search_local_send_failure_falls_back(tmp_path: pathlib.Path) -> None:
+    """本地命中但发送失败（拿不到 NapCat 目标）→ 继续平台搜索，不留死路。"""
+    plugin, host, music_dir = _prepare_plugin_with_library(tmp_path)
+    make_files(music_dir, ["夜曲.flac"])
+    from plugin import SongInfo
+
+    stub = _PlatformStubAPI([SongInfo(song_id="1", name="夜曲", platform="163")])
+    plugin._api = stub
+
+    result = asyncio.run(
+        plugin.search_and_play_music(query="夜曲", stream_id="s1")  # 不带 message → 无直连目标
+    )
+
+    assert len(stub.search_calls) >= 1, "本地发送失败后应转平台"
+    assert not stub.uploads
+    assert host.calls_of("send.custom"), "平台卡片应发出"
+
+
+def test_tool_search_local_file_intent_forces_file(tmp_path: pathlib.Path) -> None:
+    """触发消息明确要「发文件」时，本地命中也应发文件而非库默认形态。"""
+    plugin, host, music_dir = _prepare_plugin_with_library(tmp_path, send_mode="voice")
+    make_files(music_dir, ["夜曲.flac"])
+    stub = _PlatformStubAPI()
+    plugin._api = stub
+
+    result = asyncio.run(
+        plugin.search_and_play_music(
+            query="夜曲", stream_id="s1",
+            message=_qq_message(),
+            processed_plain_text="给我发夜曲的文件，要无损",
+        )
+    )
+
+    assert result["content"].startswith("已发送文件"), result
+    assert len(stub.uploads) == 1 and not stub.voices, (stub.uploads, stub.voices)
+
+
+# ---------- music_api.napcat_send_voice（真实 CQ 构造） ----------
 
 def test_napcat_send_voice_builds_record_uri() -> None:
     """真实客户端的 CQ 构造：Windows/POSIX 路径都要转成合法 file:// URI。"""

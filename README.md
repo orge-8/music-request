@@ -65,6 +65,7 @@ MaiBot 插件：搜索点歌、解析音乐链接与分享卡片，把歌曲以*
 | `[library]` | `music_dir` | `""` | 歌曲库目录（MaiBot 侧，递归扫描音频文件） |
 | `[library]` | `napcat_dir` | `""` | 同一目录在 NapCat 进程内的路径（Docker 挂载时与上面不同），留空同上 |
 | `[library]` | `send_mode` | `"file"` | 本地歌曲发送形态：`file` 音频文件（保真）/ `voice` 语音（受 QQ 转码与 60 秒限制） |
+| `[library]` | `tool_prefer_local` | `true` | LLM 点歌工具优先查本地库：强匹配直接发本地文件，未命中/发送失败再走平台 |
 | `[library]` | `refresh_minutes` | `10` | 索引自动刷新间隔（分钟），`0` = 只在重启/`/本地库 刷新` 时重扫 |
 | `[library]` | `search_limit` | `10` | 本地库搜索结果数量上限 |
 
@@ -276,7 +277,9 @@ send_mode = "file"            # file = 音频文件（推荐）/ voice = 语音
 - **索引刷新**：目录 mtime 变化且超过 `refresh_minutes` 时自动重扫；
   大批量增删歌后可 `/本地库 刷新` 立即重建。
 - **LLM 点播**：`play_local_music` 工具——用户明确说「放本地库的歌」时触发；
-  与联网点歌工具相互独立，普通点歌仍走平台搜索。
+  此外普通点歌工具 `search_and_play_music` 也会**优先查本地库**（`tool_prefer_local=true`，
+  默认开）：关键词强匹配（整串或全部关键词命中文件名）直接发本地文件，
+  未命中或发送失败再搜音乐平台；命中本地时返回文本带「来自本地歌曲库」标记。
 - **局限**：本地文件构不了音乐卡片；语音形态会受 QQ 转码（SILK）与 60 秒上限影响，
   想听完整音质请保持 `send_mode = "file"`。
 
