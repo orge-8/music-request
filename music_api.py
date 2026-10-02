@@ -1033,6 +1033,7 @@ class MusicSearchClient:
         name: str = "",
         group_id: str = "",
         user_id: str = "",
+        timeout_seconds: float | None = None,
     ) -> tuple[bool, dict[str, Any]]:
         """通过 NapCat 把本地文件当作「群文件 / 私聊文件」发送。
 
@@ -1048,6 +1049,9 @@ class MusicSearchClient:
             name: 对方看到的文件名；留空取路径里的文件名。
             group_id: 目标群号（与 `user_id` 二选一）。
             user_id: 目标 QQ 号。
+            timeout_seconds: 本次上传的超时覆盖；None 用默认 120s。
+                LLM 工具路径必须传更短的值——Host 的 invoke_tool RPC 预算只有
+                60s，内层超时超过它，工具结果永远送不回模型（真机实锤 2026-09-26）。
 
         Returns:
             `(是否成功, NapCat 响应)`。未配置 NapCat、缺目标、请求失败均返回 False。
@@ -1083,15 +1087,20 @@ class MusicSearchClient:
             return False, {}
 
         try:
-            # 上传动作单独放宽超时：QQ 完成文件传输可能要数十秒，通用 10s 会 ReadTimeout
-            upload_timeout = getattr(self, "_napcat_upload_timeout", NAPCAT_UPLOAD_TIMEOUT)
-            resp = await self._napcat.post(path, json=payload, timeout=upload_timeout)
+            # 上传动作单独放宽超时：QQ 完成文件传输可能要数十秒，通用 10s 会 ReadTimeout；
+            # 工具路径经 timeout_seconds 收紧到 Host 预算内（60s RPC，内层必须更短）
+            used_timeout = (
+                float(timeout_seconds)
+                if timeout_seconds
+                else getattr(self, "_napcat_upload_timeout", NAPCAT_UPLOAD_TIMEOUT)
+            )
+            resp = await self._napcat.post(path, json=payload, timeout=used_timeout)
             resp.raise_for_status()
             data = resp.json()
         except Exception as exc:
             logger.warning(
                 "NapCat 上传文件失败: path=%s error=%s（超时 %ss，大文件/慢盘可能仍不够）",
-                path, type(exc).__name__, getattr(self, "_napcat_upload_timeout", NAPCAT_UPLOAD_TIMEOUT),
+                path, type(exc).__name__, used_timeout,
             )
             return False, {}
         if not isinstance(data, dict):

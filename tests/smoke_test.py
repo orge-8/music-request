@@ -61,7 +61,7 @@ class StubAPI:
     async def napcat_send_message(self, message, *, group_id="", user_id=""):
         return False, {}
 
-    async def napcat_upload_file(self, file_path, *, name="", group_id="", user_id=""):
+    async def napcat_upload_file(self, file_path, *, name="", group_id="", user_id="", timeout_seconds=None):
         self.uploads.append({"file_path": file_path, "name": name, "user_id": user_id})
         return True, {"status": "ok"}
 

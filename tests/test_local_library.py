@@ -159,8 +159,11 @@ class _LocalStubAPI:
         self.upload_ok = upload_ok
         self.voice_ok = voice_ok
 
-    async def napcat_upload_file(self, file_path, *, name="", group_id="", user_id=""):
-        self.uploads.append({"file_path": file_path, "name": name, "group_id": group_id, "user_id": user_id})
+    async def napcat_upload_file(self, file_path, *, name="", group_id="", user_id="", timeout_seconds=None):
+        self.uploads.append({
+            "file_path": file_path, "name": name, "user_id": user_id,
+            "timeout_seconds": timeout_seconds,
+        })
         return self.upload_ok, {"status": "ok"}
 
     async def napcat_send_voice(self, file_path, *, group_id="", user_id=""):
@@ -393,6 +396,54 @@ def test_tool_local_voice_failure_honest_report(tmp_path: pathlib.Path) -> None:
 
     assert "发送失败" in result["content"], result
     assert "不要重复调用" in result["content"], result
+
+
+# ---------- 上传超时预算与在途去重（真机实锤 2026-09-26 回归） ----------
+
+
+def test_tool_upload_uses_short_budget_command_uses_default(tmp_path: pathlib.Path) -> None:
+    """工具路径上传超时必须 ≤45s（Host invoke_tool 预算 60s）；命令路径保持默认。"""
+    plugin, host, music_dir = _prepare_plugin_with_library(tmp_path)
+    make_files(music_dir, ["夜曲.flac"])
+    stub = _LocalStubAPI()
+    plugin._api = stub
+
+    asyncio.run(
+        plugin.play_local_music(query="夜曲", stream_id="s1", message=_qq_message())
+    )
+    assert stub.uploads and stub.uploads[0]["timeout_seconds"] == 45, stub.uploads
+
+    stub2 = _LocalStubAPI()
+    plugin._api = stub2
+    asyncio.run(
+        plugin.cmd_本地歌(
+            matched_groups={"pfx": "/", "query": "夜曲"},
+            stream_id="s2",
+            message=_qq_message(),
+        )
+    )
+    assert stub2.uploads and stub2.uploads[0]["timeout_seconds"] is None, stub2.uploads
+
+
+def test_upload_inflight_dedupe_skips_duplicate(tmp_path: pathlib.Path) -> None:
+    """同一文件已在途上传时，重复请求必须立即跳过本地（防僵尸调用重复发文件）。"""
+    plugin, host, music_dir = _prepare_plugin_with_library(tmp_path)
+    make_files(music_dir, ["夜曲.flac"])
+    stub = _LocalStubAPI()
+    plugin._api = stub
+    # 模拟另一个僵尸调用正在上传同一文件
+    plugin._local_upload_inflight.add(str((music_dir / "夜曲.flac").resolve()))
+
+    ok, _resp, _level = asyncio.run(
+        plugin.cmd_本地歌(
+            matched_groups={"pfx": "/", "query": "夜曲"},
+            stream_id="s1",
+            message=_qq_message(),
+        )
+    )
+    assert ok is False and not stub.uploads, (ok, stub.uploads)
+    text = host.sent_texts[-1] or ""
+    assert "正在发送中" in text, text
 
 
 # ---------- search_and_play_music 本地库优先 ----------

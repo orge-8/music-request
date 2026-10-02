@@ -93,6 +93,12 @@ SUPPORTED_CONFIG_VERSION = "1.5.0"
 # 待选列表的默认有效期（秒）
 _DEFAULT_SELECT_TTL = 300
 
+# LLM 工具路径的 NapCat 上传预算（秒）。
+# Host 的 plugin.invoke_tool RPC 预算是 60s：内层上传超时必须留出
+# 平台回落的时间，否则工具结果永远送不回模型（真机实锤 2026-09-26：
+# 120s 默认超时导致 3 个僵尸调用各传一遍文件，用户收到 3 个重复文件）。
+_TOOL_NAPCAT_UPLOAD_BUDGET = 45
+
 # 命令里允许的前缀字符归一化（全角 → 半角），便于与配置值比较
 _PREFIX_NORMALIZE = {
     "／": "/", "＃": "#", "！": "!", "。": ".", "：": ":",
@@ -364,6 +370,20 @@ class MusicRequestPlugin(MaiBotPlugin):
 
     config_model = MusicRequestConfig
 
+    def get_webui_config_schema(self, **kwargs) -> dict:
+        """覆写 SDK 的 WebUI 配置 Schema：做可视化模式的显示层补丁。
+
+        Runner 调这个方法拿配置页 Schema 且异常会被吞掉（变成空 Schema、
+        配置页整页空白），所以这里自己兜底：补丁失败就原样返回 SDK 输出。
+        """
+
+        schema = super().get_webui_config_schema(**kwargs)
+        try:
+            return _apply_webui_display_polish(schema)
+        except Exception:  # noqa: BLE001 —— 显示补丁失败绝不能让配置页变空白
+            logger.exception("修正 WebUI 配置 Schema 失败，回退 SDK 原样输出")
+            return schema
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)  # 必须第一行，否则 Runner 整体起不来
         self._api: Optional[MusicSearchClient] = None
@@ -380,6 +400,9 @@ class MusicRequestPlugin(MaiBotPlugin):
         self._library: Optional[LocalSongLibrary] = None
         self._library_key: Tuple[str, str, int] = ("", "", -1)
         self._lib_map_warned = False
+        # 正在上传的本地文件（MaiBot 侧绝对路径）：僵尸工具调用不去重会把
+        # 同一个文件并发传 N 遍（真机实锤 2026-09-26：用户收到 3 个重复文件）
+        self._local_upload_inflight: set = set()
 
     # ---------- 基础设施 ----------
 
@@ -575,12 +598,17 @@ class MusicRequestPlugin(MaiBotPlugin):
     async def _send_local(
         self, song: SongInfo, stream_id: str, *, silent: bool = False,
         mode: str = "", outcome: Dict[str, str] | None = None,
+        upload_timeout_seconds: float | None = None,
     ) -> bool:
         """发送本地歌曲库里的歌（文件上传或语音，均走 NapCat 直连）。
 
         本地文件没有 URL，也不经过音频缓存——文件本来就在盘上，只需要把
         MaiBot 侧路径映射成 NapCat 侧路径。`card` 形态对本地文件无意义
         （没有平台歌曲 ID 可构卡），传了就回落库配置的 send_mode。
+
+        `upload_timeout_seconds`：本次上传超时覆盖。LLM 工具路径必须传
+        「Host invoke_tool 预算（60s）以内」的值——内层超时超过外层，
+        工具结果永远送不回模型，还会留下僵尸调用继续跑（真机实锤 2026-09-26）。
         """
         library = self._get_library()
         if library is None:
@@ -625,12 +653,31 @@ class MusicRequestPlugin(MaiBotPlugin):
         display = song.display().strip() or path.stem
         api = self._get_api()
         if resolved == "file":
-            file_name = f"{display}{path.suffix}"
+            # 同文件在途去重：Host 60s 超时后的僵尸调用还在跑上传时，
+            # 新请求直接放弃本地转平台，否则 NapCat 恢复后用户会收到 N 个重复文件
+            path_key = str(path)
+            if path_key in self._local_upload_inflight:
+                self.ctx.logger.info("本地文件已在途上传，跳过本次重复请求: %s", display)
+                if outcome is not None:
+                    outcome["kind"] = "unavailable"
+                    outcome["reason"] = "同一文件正在上传中"
+                if not silent:
+                    await self.ctx.send.text(
+                        f"「{display}」正在发送中，请稍等，不要重复点", stream_id
+                    )
+                return False
+            self._local_upload_inflight.add(path_key)
             try:
-                ok, _data = await api.napcat_upload_file(napcat_path, name=file_name, **target)
-            except Exception:
-                self.ctx.logger.exception("NapCat 上传本地歌曲异常: %s", napcat_path)
-                ok = False
+                file_name = f"{display}{path.suffix}"
+                try:
+                    ok, _data = await api.napcat_upload_file(
+                        napcat_path, name=file_name, timeout_seconds=upload_timeout_seconds, **target
+                    )
+                except Exception:
+                    self.ctx.logger.exception("NapCat 上传本地歌曲异常: %s", napcat_path)
+                    ok = False
+            finally:
+                self._local_upload_inflight.discard(path_key)
             if ok:
                 self.ctx.logger.info("本地歌曲已作为文件发送: %s（%s）", file_name, napcat_path)
                 if outcome is not None:
@@ -1118,6 +1165,7 @@ class MusicRequestPlugin(MaiBotPlugin):
     async def _send_song(
         self, song: SongInfo, stream_id: str, *, silent: bool = False, mode: str = "",
         outcome: Dict[str, str] | None = None,
+        upload_timeout_seconds: float | None = None,
     ) -> bool:
         """按发送形态分发。`mode` 留空则用配置里的 `play_mode`。
 
@@ -1128,7 +1176,10 @@ class MusicRequestPlugin(MaiBotPlugin):
         resolved = (mode or str(self.config.music.play_mode)).strip().lower()
         if song.platform == PLATFORM_LOCAL:
             # 本地歌曲库：card 无意义，形态由 _send_local 内部回落 library.send_mode
-            return await self._send_local(song, stream_id, silent=silent, mode=mode, outcome=outcome)
+            return await self._send_local(
+                song, stream_id, silent=silent, mode=mode, outcome=outcome,
+                upload_timeout_seconds=upload_timeout_seconds,
+            )
         if resolved == "file":
             return await self._send_file(song, stream_id, silent=silent, outcome=outcome)
         if outcome is not None:
@@ -1761,7 +1812,8 @@ class MusicRequestPlugin(MaiBotPlugin):
                 local_song = SongInfo(**track_to_song_info_fields(tracks[0]))
                 local_outcome: Dict[str, str] = {}
                 if await self._send_song(
-                    local_song, stream_id, silent=True, mode=local_mode, outcome=local_outcome
+                    local_song, stream_id, silent=True, mode=local_mode, outcome=local_outcome,
+                    upload_timeout_seconds=_TOOL_NAPCAT_UPLOAD_BUDGET,
                 ):
                     kind = local_outcome.get("kind") or local_mode
                     self.ctx.logger.info(
@@ -1876,7 +1928,10 @@ class MusicRequestPlugin(MaiBotPlugin):
 
         song = SongInfo(**track_to_song_info_fields(tracks[0]))
         outcome: Dict[str, str] = {}
-        sent = await self._send_song(song, stream_id, silent=True, mode=mode, outcome=outcome)
+        sent = await self._send_song(
+            song, stream_id, silent=True, mode=mode, outcome=outcome,
+            upload_timeout_seconds=_TOOL_NAPCAT_UPLOAD_BUDGET,
+        )
         if sent:
             kind = outcome.get("kind") or mode
             if kind == "file":
@@ -1964,6 +2019,93 @@ class MusicRequestPlugin(MaiBotPlugin):
             return {"action": "abort" if sent else "continue"}
 
         return {"action": "continue"}
+
+
+# ================================================================ WebUI 显示层补丁
+#
+# 可视化模式的 FieldRenderer（dashboard/src/routes/plugin-config.tsx:163-361，
+# 1.3.1 布局）按 ui_type 渲染控件时只输出 label / hint / placeholder，
+# **从不渲染 description**；本插件字段的填法说明都写在 description 里，
+# 不搬进 hint，用户在配置页上一个字都看不到（源代码模式才见得到）。
+# 这里只改展示元数据，不碰任何配置键与校验语义。
+
+#: 默认收起的 section：标题自带「可选 / 默认关闭」的功能节。收起后标题
+#: 与说明仍可见，点开即可配置，避免整页卡片全开淹没常用配置。
+_WEBUI_COLLAPSED_SECTIONS: frozenset = frozenset({"netease", "napcat"})
+
+#: 手工指定的 section 标题（键 = section 名）；仅在 SDK 输出标题等于
+#: 节名（未配置 __ui_label__）时采用。
+_WEBUI_SECTION_TITLES: dict = {}
+
+#: 手工指定的字段 label（键 = 字段名）；仅在自动推导不可用时采用。
+_WEBUI_LABEL_OVERRIDES: dict = {
+    "http_url": "HTTP API 地址",
+    "storage_dir": "缓存目录",
+}
+
+
+#: 推导 label 用的中文分隔符（取最靠左的一个）
+_WEBUI_CJK_SEPS = "。！？；，：（(、"
+
+
+def _webui_label_from_description(description: str) -> str:
+    """从中文 description 里取第一小句当显示标题（取不到返回空串）。
+
+    在中英文标点里找**最靠左**的分隔符，取它前面的短语——通常是字段
+    本身的名字；超长时截到 12 字符并避免把英文单词截一半。
+    """
+    text = (description or "").strip()
+    if not text:
+        return ""
+    cut = len(text)
+    for sep in _WEBUI_CJK_SEPS:
+        idx = text.find(sep)
+        if 0 < idx < cut:
+            cut = idx
+    text = text[:cut].strip()
+    if len(text) > 12:
+        text = text[:12]
+        if " " in text[4:]:
+            text = text[: text.rfind(" ")].rstrip() or text
+    while text and text[-1] in "（(\"“：:，,；;、":
+        text = text[:-1].rstrip()
+    return text if len(text) >= 2 else ""
+
+
+def _apply_webui_display_polish(schema: dict) -> dict:
+    """把 description 抄进 hint、补中文 label / 节标题、收起可选功能节。"""
+    if not isinstance(schema, dict):
+        return schema
+    sections = schema.get("sections")
+    if not isinstance(sections, dict):
+        return schema
+    for name, section in sections.items():
+        if not isinstance(section, dict):
+            continue
+        if name in _WEBUI_COLLAPSED_SECTIONS:
+            section["collapsed"] = True
+        title = section.get("title")
+        if not title or title == name:
+            new_title = _WEBUI_SECTION_TITLES.get(name) or _webui_label_from_description(
+                section.get("description") or ""
+            )
+            if new_title and new_title != name:
+                section["title"] = new_title
+        for fname, field in (section.get("fields") or {}).items():
+            if not isinstance(field, dict):
+                continue
+            if fname == "config_version":
+                field["hidden"] = True  # 插件自维护字段：可视化模式不渲染，源代码模式仍可见
+            if not field.get("hint") and field.get("description"):
+                field["hint"] = field["description"]
+            label = field.get("label")
+            if (not label or label == fname) and field.get("description"):
+                new_label = _WEBUI_LABEL_OVERRIDES.get(fname) or _webui_label_from_description(
+                    field["description"]
+                )
+                if new_label and new_label != fname:
+                    field["label"] = new_label
+    return schema
 
 
 def create_plugin() -> MusicRequestPlugin:

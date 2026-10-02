@@ -272,6 +272,10 @@ send_mode = "file"            # file = 音频文件（推荐）/ voice = 语音
 - **发送通道**：本地文件没有 URL，走 **NapCat HTTP 直连**——`file` 形态调
   `upload_group_file` / `upload_private_file`，`voice` 形态发 `CQ:record`（file:// URI）。
   因此 `[napcat] http_url` 必须配置，且群聊/私聊目标能从消息或聊天流反查到。
+  LLM 工具路径的上传超时被压到 **45s**（Host `invoke_tool` RPC 预算 60s，内层必须更短，
+  否则工具结果送不回模型、还会留下僵尸调用重复传文件——真机实锤 2026-09-26，
+  用户收到 3 个重复文件）；命令路径保持 120s 默认。同一文件在途上传时，
+  重复请求会被去重跳过（提示「正在发送中」）。
 - **路径映射**：与音频缓存同一套逻辑。Docker 部署时把 `napcat_dir` 配成容器内路径，
   可用 `/点歌自检` 的思路核对两个目录是否同一份文件。
 - **索引刷新**：目录 mtime 变化且超过 `refresh_minutes` 时自动重扫；
