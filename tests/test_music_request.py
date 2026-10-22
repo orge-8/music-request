@@ -240,7 +240,7 @@ def test_all_config_fields_have_defaults() -> None:
     """任何字段缺默认值都会让 Runner 无法生成默认配置。"""
     config = plugin_module.MusicRequestConfig()
     dumped = config.model_dump()
-    assert set(dumped) == {"plugin", "music", "netease", "qq", "napcat", "cache", "library"}
+    assert set(dumped) == {"plugin", "music", "netease", "qq", "napcat", "cache", "library", "bilibili"}
     assert dumped["music"]["play_mode"] == "card"
     assert dumped["music"]["voice_source"] == "local"
     assert dumped["music"]["command_prefix"] == "/"
@@ -267,7 +267,10 @@ def test_config_default_platform_rejects_unknown_platform() -> None:
 def test_tool_parameters_avoid_injected_context_fields() -> None:
     signature = inspect.signature(MusicRequestPlugin.search_and_play_music)
     params = set(signature.parameters) - {"self", "kwargs"}
-    assert params == {"query", "send_as"}, f"工具参数集合异常: {params}"
+    # platform 是 v1.6.6 新增：用户说「用B站放」时工具必须有表达平台意图的入口，
+    # 否则平台信息会被整个丢掉（真机 2026-10-22：说了「用b站放世末积雨云」，
+    # 结果在网易云播了 ACE Studio Cover 翻唱版）
+    assert params == {"query", "send_as", "platform"}, f"工具参数集合异常: {params}"
     assert not (params & _INJECTED_CONTEXT_FIELDS), "工具参数名与 Host 注入字段撞车"
 
 
@@ -611,7 +614,8 @@ class _ScenarioAPI:
         return False, {}
 
     async def napcat_upload_file(
-        self, file_path: str, *, name: str = "", group_id: str = "", user_id: str = ""
+        self, file_path: str, *, name: str = "", group_id: str = "", user_id: str = "",
+        timeout_seconds: float | None = None,
     ) -> tuple[bool, dict]:
         self.uploads.append({
             "file_path": file_path,
@@ -734,6 +738,157 @@ def test_command_lists_only_in_band_candidates() -> None:
     assert listing, f"未列出候选: {host.sent_texts}"
     assert "嘘嘘声" not in listing, f"干扰项混进了候选列表: {listing}"
     assert listing.index("晚安糖果罐") < listing.index("Live"), f"未按相关度排序: {listing}"
+
+
+# ---------- 真机场景回归：点名歌手却搜偏时，按歌名重搜兜底 ----------
+#
+# 真机实锤（2026-10-20 19:59）：query='但我讨厌摇滚乐 洛天依' 整串丢给
+# 网易云搜索被歌手 token 带偏，返回 5 条无关候选（洛天依版根本不在
+# 里面），《我最讨厌摇滚乐 - 显然乐队》靠字符覆盖 0.6 分压线胜出被播出。
+
+_ROCK_GARBAGE_SONGS = [
+    # 注意首条：同专辑同歌手（《世界梦游》/ 停電前夜, 洛天依）的错歌——
+    # 歌手校验命中它，但它不是那首歌，靠可信线触发重搜
+    SongInfo(song_id="r_g1", name="为六弦琴而作", artists="停電前夜, 洛天依", platform="163"),
+    SongInfo(song_id="r_g2", name="1%（给容先生）", artists="热水店", platform="163"),
+    SongInfo(song_id="r_g3", name="三字经（说唱版）", artists="朱习爱", platform="163"),
+    SongInfo(song_id="r_g4", name="我最讨厌摇滚乐", artists="显然乐队", platform="163"),
+    SongInfo(song_id="r_g5", name="我讨厌摇滚乐（翻唱）", artists="路人乐队", platform="163"),
+]
+_ROCK_NOISE_SONG = _ROCK_GARBAGE_SONGS[3]
+_ROCK_TARGET_SONG = SongInfo(
+    song_id="r_t1", name="但我讨厌摇滚乐", artists="洛天依", platform="163"
+)
+
+
+class _QueryAwareAPI(_ScenarioAPI):
+    """按 query 返回不同结果的替身：模拟「整串搜索被歌手 token 带偏」。"""
+
+    def __init__(self, results_by_query: dict, *, unplayable: set | None = None) -> None:
+        super().__init__([], unplayable=unplayable or set())
+        self._by_query = dict(results_by_query)
+
+    async def search(self, query, platform, limit=5):
+        self.searches.append(f"{platform}:{query}")
+        return list(self._by_query.get(query) or self._by_query.get("*") or [])
+
+
+def _rock_incident_api(extra_title_results: list[SongInfo] | None = None) -> _QueryAwareAPI:
+    """本次事故的替身：整串搜索返回带偏结果，歌名搜索返回指定结果。"""
+    return _QueryAwareAPI({
+        "但我讨厌摇滚乐 洛天依": list(_ROCK_GARBAGE_SONGS),
+        "但我讨厌摇滚乐": [extra_title_results[0]] if extra_title_results else [],
+    })
+
+
+def test_tool_artist_mismatch_triggers_title_retry_and_plays_target() -> None:
+    """核心回归（2026-10-20 19:59）：歌名重搜兜底必须把正确版本捞回来。"""
+    plugin, host = _prepare_plugin()
+    plugin._api = _rock_incident_api([_ROCK_TARGET_SONG])
+
+    result = asyncio.run(
+        plugin.search_and_play_music(query="但我讨厌摇滚乐 洛天依", stream_id="s1")
+    )
+
+    assert "已播放" in result["content"], f"正确版本没播出来: {result}"
+    assert "但我讨厌摇滚乐" in result["content"], result["content"]
+    assert "我最讨厌摇滚乐" not in result["content"], f"播了干扰项: {result}"
+    assert "为六弦琴而作" not in result["content"], f"播了同歌手错歌: {result}"
+    assert "163:但我讨厌摇滚乐 洛天依" in plugin._api.searches
+    assert "163:但我讨厌摇滚乐" in plugin._api.searches, f"没触发歌名重搜: {plugin._api.searches}"
+
+
+def test_tool_artist_filter_drops_cover_without_retry() -> None:
+    """正向对照：目标就在首轮候选里时，歌手不匹配的翻唱被剔除且不触发重搜。"""
+    plugin, host = _prepare_plugin()
+    plugin._api = _QueryAwareAPI({
+        "但我讨厌摇滚乐 洛天依": [_ROCK_NOISE_SONG, _ROCK_TARGET_SONG],
+        "*": [],
+    })
+
+    result = asyncio.run(
+        plugin.search_and_play_music(query="但我讨厌摇滚乐 洛天依", stream_id="s1")
+    )
+
+    assert "已播放" in result["content"], result["content"]
+    assert "但我讨厌摇滚乐" in result["content"], result["content"]
+    assert "163:但我讨厌摇滚乐" not in plugin._api.searches, (
+        f"目标在首轮候选里时不该触发重搜: {plugin._api.searches}"
+    )
+
+
+def test_tool_single_garbage_result_goes_through_title_retry() -> None:
+    """单结果旁路已封：平台只回 1 条干扰项时，也要过歌名重搜而不是直接播。"""
+    plugin, host = _prepare_plugin()
+    plugin._api = _QueryAwareAPI({
+        "但我讨厌摇滚乐 洛天依": [_ROCK_NOISE_SONG],
+        "但我讨厌摇滚乐": [_ROCK_TARGET_SONG],
+    })
+
+    result = asyncio.run(
+        plugin.search_and_play_music(query="但我讨厌摇滚乐 洛天依", stream_id="s1")
+    )
+
+    assert "已播放" in result["content"], f"单条干扰项绕过了重搜: {result}"
+    assert "但我讨厌摇滚乐" in result["content"], result["content"]
+    assert "我最讨厌摇滚乐" not in result["content"], result["content"]
+
+
+def test_tool_unreliable_candidates_report_failure_instead_of_playing() -> None:
+    """歌也不存在（重搜仍全是干扰项）时必须报失败，宁缺毋错。"""
+    plugin, host = _prepare_plugin()
+    plugin._api = _rock_incident_api()  # 歌名重搜返回空 → 沿用不可信首轮
+
+    result = asyncio.run(
+        plugin.search_and_play_music(query="但我讨厌摇滚乐 洛天依", stream_id="s1")
+    )
+
+    assert "已播放" not in result["content"], f"把干扰项当成结果播了: {result}"
+    assert not host.calls_of("send.custom"), (
+        f"不应发出任何歌曲消息，实际: {host.calls_of('send.custom')}"
+    )
+    assert "均未取到可播放音频" in result["content"], result["content"]
+
+
+def test_tool_english_multiword_title_survives_credibility_guard() -> None:
+    """守卫不误伤多词英文歌名：整串搜到正确版本时照常播出。"""
+    target = SongInfo(
+        song_id="e_t1", name="Shape of You", artists="Ed Sheeran", platform="163"
+    )
+    plugin, host = _prepare_plugin()
+    plugin._api = _QueryAwareAPI({
+        "shape of you": [target],
+        "shape": [
+            SongInfo(song_id="e_g1", name="Shape", artists="Unknown", platform="163"),
+        ],
+    })
+
+    result = asyncio.run(
+        plugin.search_and_play_music(query="shape of you", stream_id="s1")
+    )
+
+    assert "已播放" in result["content"], f"多词歌名被守卫误杀: {result}"
+    assert "Shape of You" in result["content"], result["content"]
+
+
+def test_command_path_also_retries_by_title() -> None:
+    """命令路径走同一条「重搜」链路：/点歌 也能把正确版本捞回来。"""
+    plugin, host = _prepare_plugin(play_mode="card")
+    plugin._api = _rock_incident_api([_ROCK_TARGET_SONG])
+
+    ok, _resp, _level = asyncio.run(
+        plugin.cmd_点歌(
+            matched_groups={"pfx": "/", "query": "但我讨厌摇滚乐 洛天依"}, stream_id="s1"
+        )
+    )
+
+    assert ok is True
+    cards = host.calls_of("send.custom")
+    assert cards, "未发送任何卡片"
+    assert cards[0].get("data") == {"type": "163", "id": _ROCK_TARGET_SONG.song_id}, cards[0]
+    assert "163:但我讨厌摇滚乐" in plugin._api.searches, (
+        f"命令路径没触发歌名重搜: {plugin._api.searches}"
+    )
 
 
 # ---------- 发送形态（voice / file）与 NapCat 文件上传 ----------
@@ -871,7 +1026,7 @@ def test_tool_reports_file_when_upload_succeeds() -> None:
     plugin._api = api
     plugin._cache = _FakeCache()
     # 工具拿不到 message 时按 stream_id 反查聊天流；测试里直接注入缓存目标
-    plugin._qq_targets["s1"] = {"user_id": "3816023959"}
+    plugin._qq_targets["s1"] = {"user_id": "1234567890"}
 
     result = asyncio.run(
         plugin.search_and_play_music(query="晚安糖果罐", send_as="file", stream_id="s1")
@@ -922,7 +1077,7 @@ def test_llm_send_as_file_without_user_intent_falls_back() -> None:
     api.upload_ok = True
     plugin._api = api
     plugin._cache = _FakeCache()
-    plugin._qq_targets["s1"] = {"user_id": "3816023959"}
+    plugin._qq_targets["s1"] = {"user_id": "1234567890"}
 
     result = asyncio.run(
         plugin.search_and_play_music(
@@ -944,7 +1099,7 @@ def test_user_file_intent_still_wins() -> None:
     api.upload_ok = True
     plugin._api = api
     plugin._cache = _FakeCache()
-    plugin._qq_targets["s1"] = {"user_id": "3816023959"}
+    plugin._qq_targets["s1"] = {"user_id": "1234567890"}
 
     result = asyncio.run(
         plugin.search_and_play_music(
@@ -964,7 +1119,7 @@ def test_llm_send_as_file_kept_when_user_intent_present() -> None:
     api.upload_ok = True
     plugin._api = api
     plugin._cache = _FakeCache()
-    plugin._qq_targets["s1"] = {"user_id": "3816023959"}
+    plugin._qq_targets["s1"] = {"user_id": "1234567890"}
 
     result = asyncio.run(
         plugin.search_and_play_music(
@@ -983,7 +1138,7 @@ def test_no_trigger_text_does_not_fall_back() -> None:
     api.upload_ok = True
     plugin._api = api
     plugin._cache = _FakeCache()
-    plugin._qq_targets["s1"] = {"user_id": "3816023959"}
+    plugin._qq_targets["s1"] = {"user_id": "1234567890"}
 
     result = asyncio.run(
         plugin.search_and_play_music(query="万能处方", send_as="file", stream_id="s1")

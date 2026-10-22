@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 # 平台标识
 PLATFORM_NETEASE = "163"
 PLATFORM_QQ = "qq"
+PLATFORM_BILI = "bili"
 
 #: 短链解析目标的域名白名单（防 SSRF：短链不得把请求导向内网/元数据地址）
 ALLOWED_MUSIC_HOSTS = frozenset({

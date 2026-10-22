@@ -40,6 +40,15 @@ _DOWNLOAD_HEADERS = {
     "Referer": "https://music.163.com/",
 }
 
+# 按平台覆盖下载头：B站 CDN 校验 Referer 必须是 bilibili 域，带网易云的
+# Referer 会被 403。未列出的平台沿用默认头（httpx 按请求合并、逐键覆盖）。
+_DOWNLOAD_HEADERS_BY_PLATFORM: dict[str, dict[str, str]] = {
+    "bili": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://www.bilibili.com/",
+    },
+}
+
 # 读取大小上限的块大小
 _CHUNK_SIZE = 64 * 1024
 
@@ -301,7 +310,10 @@ class MusicAudioCache:
             if path.is_file() and path.stat().st_size > 0:
                 self._touch(path)
                 return path
-            await self._download(path, url, ext)
+            await self._download(
+                path, url, ext,
+                headers=_DOWNLOAD_HEADERS_BY_PLATFORM.get(str(platform or "").lower()),
+            )
 
         return path
 
@@ -318,14 +330,20 @@ class MusicAudioCache:
             self._in_use[path] = count - 1
         self._touch(path)
 
-    async def _download(self, path: Path, url: str, suffix: str) -> None:
-        """流式下载并原子落盘，逐块校验大小上限与文件头。"""
+    async def _download(self, path: Path, url: str, suffix: str, *, headers: dict | None = None) -> None:
+        """流式下载并原子落盘，逐块校验大小上限与文件头。
+
+        `headers` 为按平台覆盖的请求头（如 B站 CDN 要求 bilibili 域 Referer）；
+        None 时用 client 默认头。
+        """
         assert self._client is not None
         tmp = path.with_suffix(path.suffix + ".tmp")
         # 目录可能被用户删掉（或从未初始化过）：这里必须自建，否则下载必炸
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            async with self._client.stream("GET", url) as resp:
+            # 仅在有平台覆盖头时传 headers，避免无谓地改变普通平台的调用形态
+            kwargs = {"headers": headers} if headers else {}
+            async with self._client.stream("GET", url, **kwargs) as resp:
                 if resp.status_code >= 400:
                     raise AudioCacheError(f"下载音频失败: HTTP {resp.status_code}")
                 total = 0

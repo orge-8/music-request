@@ -55,7 +55,7 @@ def _run_tool(
     plugin._api = api
     plugin._cache = _FakeCache()
     if bind_target:
-        plugin._qq_targets["s1"] = {"user_id": "3816023959"}
+        plugin._qq_targets["s1"] = {"user_id": "1234567890"}
     kwargs: dict[str, Any] = {"query": query, "stream_id": stream_id}
     if send_as is not _UNSET:
         kwargs["send_as"] = send_as

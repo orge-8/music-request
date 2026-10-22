@@ -26,6 +26,7 @@ import json
 import logging
 import re
 import secrets
+import traceback
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -35,6 +36,7 @@ import httpx
 try:  # 包式加载（Runner 的主路径）：命名空间化，避免与别的插件顶层模块撞名
     from .url_parser import (
         ALLOWED_MUSIC_HOSTS,
+        PLATFORM_BILI,
         PLATFORM_NETEASE,
         PLATFORM_QQ,
         is_allowed_music_url,
@@ -42,6 +44,7 @@ try:  # 包式加载（Runner 的主路径）：命名空间化，避免与别�
 except ImportError:  # 平铺兜底：脚本直跑 / 测试
     from url_parser import (
         ALLOWED_MUSIC_HOSTS,
+        PLATFORM_BILI,
         PLATFORM_NETEASE,
         PLATFORM_QQ,
         is_allowed_music_url,
@@ -180,7 +183,7 @@ _SENSITIVE_KEY_PARTS = (
 
 
 def _redact(value: Any) -> Any:
-    """递归遮蔽响应中的凭据字段。"""
+    """递归遮蔽响应中的凭据字段（结构化数据用）。"""
     if isinstance(value, dict):
         out: dict[str, Any] = {}
         for key, item in value.items():
@@ -203,6 +206,70 @@ def _preview(value: Any) -> str:
     if len(text) > _PREVIEW_LIMIT:
         return text[:_PREVIEW_LIMIT] + f"...(len={len(text)})"
     return text
+
+
+# ---------- 字符串级脱敏：兜住「异常消息里夹带凭据」----------
+#
+# 结构化响应体由 `_redact` 处理；这一条管**字符串路径**——异常对象、
+# 适配器返回串、HTTP 错误文本。
+
+_SECRET_KV_RE = re.compile(
+    r"((?:p_skey|skey|qqmusic_key|music_u|qm_keyst|csrf|token|password|secret|"
+    r"ticket|signature|authst|authorization|sessdata|buvid3)\s*[=:]\s*)"
+    r"([^\s;,&\"'\uff09\)]+)",
+    re.IGNORECASE,
+)
+# cookie 值可能很长（uin=...; p_skey=...），整段遮蔽，不要截到第一个分号就停
+_COOKIE_VALUE_RE = re.compile(
+    r"((?:cookie|cookies)\s*[=:]\s*)([^\r\n\"']+)", re.IGNORECASE
+)
+
+
+def redact_secrets(text: Any) -> str:
+    """遮蔽文本里的凭据值；键名、结构、状态码都保留，只吃掉值。
+
+    保住诊断信息比「整条日志都不打」更利于排障。
+    """
+    out = str(text or "")
+    out = _COOKIE_VALUE_RE.sub(lambda m: f"{m.group(1)}<redacted>", out)
+    out = _SECRET_KV_RE.sub(r"\1<redacted>", out)
+    return out
+
+
+class SecretScrubbingFilter(logging.Filter):
+    """日志脱敏 Filter：一次安装，覆盖本插件所有日志点。
+
+    为什么做在 Filter 里而不是逐个改日志点：`logger.exception()` 打印的是
+    `exc_info`（完整 traceback，含异常消息原文），`logging.Filter` 拿不到
+    格式化后的 traceback 文本 —— 只能在这里**预先**格式化并脱敏，再清空
+    `exc_info` 才能真正挡住。逐个改调用点既会遗漏，也会把堆栈信息一起丢掉。
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            text = record.getMessage()
+        except Exception:  # noqa: BLE001 - 过滤器自身绝不能抛
+            return True
+        if record.exc_info:
+            try:
+                tb = "".join(traceback.format_exception(*record.exc_info))
+            except Exception:  # noqa: BLE001
+                tb = ""
+            if tb:
+                text = f"{text}\n{tb}"
+            record.exc_info = None
+            record.exc_text = None
+        record.msg = redact_secrets(text)
+        record.args = ()
+        return True
+
+
+def install_secret_scrubber(logger: logging.Logger) -> None:
+    """给指定 logger 装上脱敏 Filter（幂等，重复调用不会叠加）。"""
+    for existing in logger.filters:
+        if isinstance(existing, SecretScrubbingFilter):
+            return
+    logger.addFilter(SecretScrubbingFilter())
 
 
 class MusicAPIResponseError(RuntimeError):
@@ -290,6 +357,9 @@ class MusicSearchClient:
         qq_cookie: 形如 `{"uin": "...", "qqmusic_key": "..."}`。
         napcat_url: NapCat HTTP API 根地址；留空则禁用直连通道。
         napcat_token: NapCat 访问令牌；留空表示不鉴权。
+        bili_enabled: 是否启用 B站平台。
+        bili_sessdata: B站 SESSDATA Cookie（登录态；空 = 匿名）。
+        bili_buvid3: B站 buvid3 Cookie（留空自动经 SPI 接口获取）。
     """
 
     def __init__(
@@ -298,6 +368,9 @@ class MusicSearchClient:
         qq_cookie: dict[str, str] | None = None,
         napcat_url: str = "",
         napcat_token: str = "",
+        bili_enabled: bool = False,
+        bili_sessdata: str = "",
+        bili_buvid3: str = "",
     ) -> None:
         self._netease_cookie = netease_cookie or {}
         self._qq_cookie = {
@@ -353,6 +426,18 @@ class MusicSearchClient:
                 # 归一化后拿不到主机名（如 "/"、"http://"）→ 视为未配置，禁用直连
                 logger.warning("napcat.http_url 无有效主机名，直连通道已禁用: %r", napcat_url)
 
+        # B站子客户端：惰性 import 避免 music_api ↔ bilibili_api 顶层循环依赖
+        # （bilibili_api 顶层要拿本模块的 MusicAPIResponseError / SongInfo）
+        self._bili: Any = None
+        if bili_enabled:
+            try:  # 包式加载优先，平铺兜底
+                from .bilibili_api import BilibiliClient
+            except ImportError:
+                from bilibili_api import BilibiliClient
+            self._bili = BilibiliClient(
+                sessdata=bili_sessdata, buvid3=bili_buvid3,
+            )
+
     # ---------- 生命周期 ----------
 
     async def close(self) -> None:
@@ -364,19 +449,54 @@ class MusicSearchClient:
                 await client.aclose()
             except Exception:
                 logger.debug("关闭 HTTP 客户端失败", exc_info=True)
+        if self._bili is not None:
+            await self._bili.close()
 
     @property
     def qq_search_enabled(self) -> bool:
         """QQ音乐搜索需要登录态（uin + qqmusic_key 齐备）。"""
         return bool(self._qq_cookie.get("uin") and self._qq_cookie.get("qqmusic_key"))
 
+    @property
+    def bili_available(self) -> bool:
+        """B站平台是否已启用（客户端存在）。"""
+        return self._bili is not None
+
+    @property
+    def bili_last_error(self) -> str:
+        """B站最近一次取流失败的原因（无失败则为空串）。
+
+        上层用它把「未返回可用音频」这句无信息量的话补成可归因的提示：
+        412 风控、SESSDATA 失效、视频被删、dash 缺音频轨，四者处置完全不同。
+        """
+        return str(getattr(self._bili, "last_error", "") or "")
+
+    @property
+    def bili_login_state(self) -> bool | None:
+        """B站登录态实测值：None=未验证，True=有效，False=SESSDATA 已失效。"""
+        state = getattr(self._bili, "login_state", None)
+        return state if isinstance(state, bool) else None
+
     # ---------- 统一入口 ----------
 
     async def search(self, query: str, platform: str, limit: int = 5) -> list[SongInfo]:
         """按平台搜索歌曲。"""
+        if platform == PLATFORM_BILI:
+            if self._bili is None:
+                raise MusicAPIResponseError("B站平台未启用（配置 [bilibili].enabled）")
+            return await self._bili.search_videos(query, limit)
         if platform == PLATFORM_QQ:
             return await self.search_qq(query, limit)
         return await self.search_netease(query, limit)
+
+    async def bili_duration(self, video_id: str) -> int | None:
+        """取 B站视频总时长（秒）；B站未启用或查不到返回 None。
+
+        供 VCPedia 直连前做时长闸：超过上限就不直连，免得白等一次上传超时。
+        """
+        if self._bili is None:
+            return None
+        return await self._bili.get_video_duration(video_id)
 
     async def get_song_url(
         self,
@@ -397,6 +517,11 @@ class MusicSearchClient:
         Returns:
             音频直链；拿不到返回 None。
         """
+        if platform == PLATFORM_BILI:
+            if self._bili is None:
+                raise MusicAPIResponseError("B站平台未启用（配置 [bilibili].enabled）")
+            # B站音频轨容器即 m4a，调用方落盘时按 .m4a 后缀处理
+            return await self._bili.get_audio_url(song_id)
         if platform == PLATFORM_QQ:
             return await self._qq_song_url(song_id, media_id, mp3_only=mp3_only)
         return await self._netease_song_url(song_id, mp3_only=mp3_only)

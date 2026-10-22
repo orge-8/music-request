@@ -402,7 +402,12 @@ def test_tool_local_voice_failure_honest_report(tmp_path: pathlib.Path) -> None:
 
 
 def test_tool_upload_uses_short_budget_command_uses_default(tmp_path: pathlib.Path) -> None:
-    """工具路径上传超时必须 ≤45s（Host invoke_tool 预算 60s）；命令路径保持默认。"""
+    """工具路径上传超时必须 < Host RPC 预算（60s）；命令路径保持默认。
+
+    2026-10-22 由 45 上调到 50：B站直连的原曲文件更大（4 分钟约 8.9MB、
+    上传 28s），45s 对 6 分钟以上的曲目余量太薄。**但不能到 60**——
+    50s + 10s 回落正好卡满 RPC 预算，再高工具结果就送不回模型了。
+    """
     plugin, host, music_dir = _prepare_plugin_with_library(tmp_path)
     make_files(music_dir, ["夜曲.flac"])
     stub = _LocalStubAPI()
@@ -411,7 +416,7 @@ def test_tool_upload_uses_short_budget_command_uses_default(tmp_path: pathlib.Pa
     asyncio.run(
         plugin.play_local_music(query="夜曲", stream_id="s1", message=_qq_message())
     )
-    assert stub.uploads and stub.uploads[0]["timeout_seconds"] == 45, stub.uploads
+    assert stub.uploads and stub.uploads[0]["timeout_seconds"] == 50, stub.uploads
 
     stub2 = _LocalStubAPI()
     plugin._api = stub2

@@ -53,9 +53,18 @@ try:  # 包式加载优先（Runner 主路径）：模块挂到 <插件名>.* �
         keyword_tokens,
         track_to_song_info_fields,
     )
-    from .music_api import MusicAPIResponseError, MusicSearchClient, SongInfo
-    from .search_rank import rank_songs
+    from .music_api import (
+        MusicAPIResponseError, MusicSearchClient, SongInfo, install_secret_scrubber,
+    )
+    from .search_rank import (
+        TITLE_CREDIBILITY_LINE,
+        rank_songs,
+        score_song,
+        split_by_artist_match,
+        title_retry_token,
+    )
     from .url_parser import (
+        PLATFORM_BILI,
         PLATFORM_NETEASE,
         PLATFORM_QQ,
         MusicCardInfo,
@@ -72,9 +81,18 @@ except ImportError:  # 平铺兜底：脚本直跑 / 本地测试 / 旧式加载
         keyword_tokens,
         track_to_song_info_fields,
     )
-    from music_api import MusicAPIResponseError, MusicSearchClient, SongInfo
-    from search_rank import rank_songs
+    from music_api import (
+        MusicAPIResponseError, MusicSearchClient, SongInfo, install_secret_scrubber,
+    )
+    from search_rank import (
+        TITLE_CREDIBILITY_LINE,
+        rank_songs,
+        score_song,
+        split_by_artist_match,
+        title_retry_token,
+    )
     from url_parser import (
+        PLATFORM_BILI,
         PLATFORM_NETEASE,
         PLATFORM_QQ,
         MusicCardInfo,
@@ -88,7 +106,32 @@ __plugin_id__ = "github.cateye.music-request"
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_CONFIG_VERSION = "1.5.0"
+SUPPORTED_CONFIG_VERSION = "1.7.4"
+
+#: 歌词曲库插件 ID —— 本插件向它查询「某首 V家曲的原曲 B站标识」。
+#: 通过跨插件只读 API `get_song_bilibili` 调用（能力 `api.call`）。
+#: 未安装 / 未启用 / 未收录时一律静默回退到 B站搜索，不报错。
+VCPEDIA_PLUGIN_ID = "org.mai-mai.cv-lyric-context"
+
+#: LLM 工具入参里的「显式平台」别名表。
+#:
+#: 必须与 `_resolve_platform` 分开：后者对无法识别的值会**兜底成默认平台**，
+#: 用它判断「用户是否显式指定了平台」会误判——空串或乱码都会变成 163，
+#: 于是 `/点歌` 的显式平台语义和「用户没说」就混成一件事了。
+_PLATFORM_ALIASES: Dict[str, str] = {
+    "163": PLATFORM_NETEASE,
+    "网易": PLATFORM_NETEASE,
+    "网易云": PLATFORM_NETEASE,
+    "网易云音乐": PLATFORM_NETEASE,
+    "netease": PLATFORM_NETEASE,
+    "qq": PLATFORM_QQ,
+    "qq音乐": PLATFORM_QQ,
+    "qqmusic": PLATFORM_QQ,
+    "bili": PLATFORM_BILI,
+    "bilibili": PLATFORM_BILI,
+    "b站": PLATFORM_BILI,
+    "哔哩哔哩": PLATFORM_BILI,
+}
 
 # 待选列表的默认有效期（秒）
 _DEFAULT_SELECT_TTL = 300
@@ -97,7 +140,20 @@ _DEFAULT_SELECT_TTL = 300
 # Host 的 plugin.invoke_tool RPC 预算是 60s：内层上传超时必须留出
 # 平台回落的时间，否则工具结果永远送不回模型（真机实锤 2026-09-26：
 # 120s 默认超时导致 3 个僵尸调用各传一遍文件，用户收到 3 个重复文件）。
-_TOOL_NAPCAT_UPLOAD_BUDGET = 45
+#
+# 2026-10-22 上调 45 → 50：B站直连的原曲文件比音乐平台大（实测 4 分钟约 8.9MB，
+# 上传耗时 28s），45s 对 6 分钟以上的曲目余量太薄。**不能再往上调**——
+# 50s + 10s 回落 = 60s，正好卡满 RPC 预算；设 60s 会让工具结果丢失。
+_TOOL_NAPCAT_UPLOAD_BUDGET = 50
+
+#: VCPedia 直连的时长闸（秒）。
+#:
+#: 与 `bilibili.max_duration_seconds`（搜索结果候选过滤，默认 600）**语义不同**：
+#: 这里判的是「能不能在上传预算内发完」，不是「这首值不值得播」。
+#: 实测音频码率约 38.5KB/s、上传速度约 318KB/s ⇒ 50s 预算约覆盖 413s；
+#: 取 420s 并留一点余量。超过就不直连，直接回退平台搜索，
+#: 免得白等一次 50 秒超时（「洛天依带你铁道唱歌」系列单P 8.3 分钟，必然传不完）。
+_VCPEDIA_MAX_DIRECT_SECONDS = 420
 
 # 命令里允许的前缀字符归一化（全角 → 半角），便于与配置值比较
 _PREFIX_NORMALIZE = {
@@ -128,6 +184,102 @@ _RE_FILE_INTENT = re.compile(
 
 # 否定 / 反问词：与文件关键词同现于同一小句时，视为「不要文件」
 _RE_FILE_INTENT_NEG = re.compile(r"不|别|勿|无需|免了|没必要|干嘛|干什么|为什么|为啥|咋")
+
+
+def _prefix_extra_text(query: str, matched_name: str) -> str:
+    """查询串里超出「曲库命中歌名」的那部分（通常是歌手）。"""
+    text = str(query or "").strip()
+    name = str(matched_name or "").strip()
+    if name and text.startswith(name):
+        return text[len(name):].strip()
+    return ""
+
+
+def _mentions_any_name(text: str, names: Any) -> bool:
+    """text 里是否出现 `names` 中的任一个（忽略空格与大小写）。
+
+    用途：判断用户点的是原曲还是翻唱。歌手里既有中文（洛天依）也有英文
+    （StarryLily），统一去空格 + 小写后做子串匹配即可覆盖。
+    """
+    haystack = str(text or "").replace(" ", "").lower()
+    if not haystack:
+        return False
+    for name in names or []:
+        needle = str(name or "").replace(" ", "").lower()
+        if needle and needle in haystack:
+            return True
+    return False
+
+
+def _appears_in_text(token: str, text: str) -> bool:
+    """`token` 是否出现在 `text` 里（忽略空格与大小写）。
+
+    用来判断查询串里的歌手是**用户自己说的**，还是模型/上游注入补进来的。
+    真机 2026-10-22 21:48：用户只说了「放一首世末歌者」，Planner 传的
+    query 却是 `世末歌者 洛天依`（洛天依既不是原曲歌手乐正绫，用户也没提），
+    结果这一刀切否决了本可命中的原曲，随后三个平台都搜不到而全部失败。
+    """
+    needle = str(token or "").replace(" ", "").lower()
+    haystack = str(text or "").replace(" ", "").lower()
+    return bool(needle) and needle in haystack
+
+
+def _platform_alias_in_text(text: str, platform: str) -> bool:
+    """用户原话里是否提到了某个平台（用它的任一别名做子串匹配）。
+
+    用来校验 LLM 传来的 `platform` 参数有没有依据。
+    真机 2026-10-22 22:14：用户只说「放一首世末告白」，Planner 却传了
+    `platform='qq'`。那一步绕过了 VCPedia 优先（按设计显式平台不查曲库），
+    而 QQ 音乐登录态失效 → 全链路失败；可曲库里这首歌是有原曲标识的。
+    """
+    haystack = str(text or "").replace(" ", "").lower()
+    if not haystack:
+        return False
+    for alias, mapped in _PLATFORM_ALIASES.items():
+        if mapped == platform and alias.replace(" ", "").lower() in haystack:
+            return True
+    return False
+
+
+class _RecentInboundText:
+    """按 stream_id 记住最近一条**入站用户消息**的纯文本（短 TTL）。
+
+    为什么需要这一层：`search_and_play_music` 的工具载荷里**没有用户原话**
+    （只有 query / send_as / platform / stream_id），而所有「参数可信度校验」
+    都必须拿原话做基准。真机 2026-10-22 22:27 实证：`trigger_text` 一直是空，
+    于是 `platform` 校验与 prefix 的歌手校验**全部静默失效**——Planner 幻觉出的
+    `platform='qq'` 一路生效，用户连点四首全部失败。
+
+    入站文本由 `chat.receive.after_process` 钩子登记（那里能拿到 message）。
+    只保留每个会话最近一条：点歌总是紧跟触发它的那条消息，覆盖写即可。
+    """
+
+    def __init__(self, ttl: float = 180.0) -> None:
+        # 不做下限保护：TTL 由内部常量提供，允许 0（等于禁用缓存），
+        # 这样也便于测试用极短 TTL 验证过期逻辑。
+        self._ttl = max(0.0, float(ttl))
+        self._items: Dict[str, tuple[float, str]] = {}
+
+    def remember(self, stream_id: str, text: str) -> None:
+        """登记一条入站文本（空串/空会话忽略）。"""
+        sid = str(stream_id or "").strip()
+        body = str(text or "").strip()
+        if sid and body:
+            self._items[sid] = (time.time(), body)
+
+    def get(self, stream_id: str) -> str:
+        """取该会话最近一条入站文本；过期或不存在返回空串。"""
+        sid = str(stream_id or "").strip()
+        if not sid:
+            return ""
+        item = self._items.get(sid)
+        if item is None:
+            return ""
+        stamp, body = item
+        if time.time() - stamp > self._ttl:
+            self._items.pop(sid, None)
+            return ""
+        return body
 
 # 小句切分：按中英文标点与换行拆分，逐句独立判断意图
 _RE_CLAUSE_SPLIT = re.compile(r"[，。！？；、,.!?;\n]+")
@@ -287,6 +439,44 @@ class NapCatConfig(PluginConfigBase):
     http_token: str = Field(default="", description="NapCat 访问令牌，留空表示不鉴权")
 
 
+class BilibiliConfig(PluginConfigBase):
+    """B站（bilibili）视频音频平台。
+
+    音频来源是视频里的 DASH 音频轨（m4a），**固定以文件形态发送**：
+    语音通道会强制转码 SILK 且限 60 秒，对 B站视频音频基本必踩，不提供。
+    未配置 SESSDATA 时匿名可用，但音质上限 64k 且更容易触发风控。
+    """
+
+    __ui_label__ = "B站"
+    __ui_icon__ = "tv"
+    __ui_order__ = 7
+
+    enabled: bool = Field(
+        default=True,
+        description="是否启用 B站平台（搜索视频并提取音频；固定以文件形态发送，需 NapCat HTTP API）",
+    )
+    sessdata: str = Field(
+        default="",
+        description="SESSDATA Cookie（登录凭证；未配置时匿名可用，音质上限 64k 且易触发风控）",
+    )
+    buvid3: str = Field(
+        default="",
+        description="buvid3 Cookie；留空自动经 SPI 接口获取（一般不用手填）",
+    )
+    max_duration_seconds: int = Field(
+        default=600, ge=30, le=7200,
+        description="候选视频时长上限（秒）：搜索结果里超长的视频直接过滤",
+    )
+    vcpedia_lookup: bool = Field(
+        default=True,
+        description=(
+            "优先查 VCPedia 曲库的原曲 B站标识（需安装 cv_lyric_context 插件）："
+            "命中时跳过搜索直接按原曲 aid/BV 取流，避开搜索风控与翻唱误匹配；"
+            "未安装或未收录则自动回退搜索"
+        ),
+    )
+
+
 class AudioCacheConfig(PluginConfigBase):
     """voice 模式的本地音频缓存（MaiBot 与 NapCat 必须能看到同一份文件）。"""
 
@@ -356,6 +546,7 @@ class MusicRequestConfig(PluginConfigBase):
     napcat: NapCatConfig = Field(default_factory=NapCatConfig)
     cache: AudioCacheConfig = Field(default_factory=AudioCacheConfig)
     library: LibraryConfig = Field(default_factory=LibraryConfig)
+    bilibili: BilibiliConfig = Field(default_factory=BilibiliConfig)
 
 
 # ===== 插件主类 =====
@@ -403,6 +594,8 @@ class MusicRequestPlugin(MaiBotPlugin):
         # 正在上传的本地文件（MaiBot 侧绝对路径）：僵尸工具调用不去重会把
         # 同一个文件并发传 N 遍（真机实锤 2026-09-26：用户收到 3 个重复文件）
         self._local_upload_inflight: set = set()
+        # 最近一条入站用户消息（按会话）：工具载荷里没有原话，参数校验要用
+        self._inbound_text = _RecentInboundText()
 
     # ---------- 基础设施 ----------
 
@@ -438,6 +631,9 @@ class MusicRequestPlugin(MaiBotPlugin):
                 qq_cookie=qq_cookie,
                 napcat_url=self.config.napcat.http_url,
                 napcat_token=self.config.napcat.http_token,
+                bili_enabled=bool(self.config.bilibili.enabled),
+                bili_sessdata=self.config.bilibili.sessdata,
+                bili_buvid3=self.config.bilibili.buvid3,
             )
         return self._api
 
@@ -479,9 +675,12 @@ class MusicRequestPlugin(MaiBotPlugin):
           **本地路径**而不是 URL，必须先把文件落盘
         - `voice` + `voice_source=local`：把 MP3 落盘交给 NapCat 发语音
         - LLM 默认要发文件时（tool_default_mode=file），缓存也得先就绪
+        - B站平台启用：B站固定走文件形态，缓存就是它的发送前提
         """
         music = self.config.music
         if music.play_mode == "file" or music.tool_default_mode == "file":
+            return True
+        if self.config.bilibili.enabled:
             return True
         return music.play_mode == "voice" and music.voice_source == "local"
 
@@ -761,19 +960,50 @@ class MusicRequestPlugin(MaiBotPlugin):
         return normalized == configured
 
     def _resolve_platform(self, platform: str = "") -> str:
-        """把各种平台写法归一成 `163` / `qq`。"""
+        """把各种平台写法归一成 `163` / `qq` / `bili`。"""
         value = (platform or "").strip().lower()
         if value in (PLATFORM_NETEASE, "网易", "网易云", "网易云音乐", "netease"):
             return PLATFORM_NETEASE
         if value in (PLATFORM_QQ, "qq音乐", "qqmusic"):
             return PLATFORM_QQ
+        if value in (PLATFORM_BILI, "bilibili", "b站", "哔哩哔哩"):
+            return PLATFORM_BILI
         default = str(self.config.music.default_platform).strip().lower()
         return default if default in (PLATFORM_NETEASE, PLATFORM_QQ) else PLATFORM_NETEASE
 
     @staticmethod
+    def _try_explicit_platform(platform: str) -> str:
+        """入参是**合法平台写法**时返回平台标识，否则返回空串（= 用户没指定）。
+
+        用途：区分「用户明确说用B站」与「用户没说」。`_resolve_platform` 会把
+        无法识别的值兜底成默认平台，不能拿来做这个判断。
+        """
+        return _PLATFORM_ALIASES.get(str(platform or "").strip().lower(), "")
+
+    @staticmethod
     def _platform_name(platform: str) -> str:
         """平台标识转展示名。"""
-        return "QQ音乐" if platform == PLATFORM_QQ else "网易云音乐"
+        if platform == PLATFORM_QQ:
+            return "QQ音乐"
+        if platform == PLATFORM_BILI:
+            return "B站"
+        return "网易云音乐"
+
+    def _bili_sessdata_state(self) -> str:
+        """B站 SESSDATA 的展示态：区分「没配」「配了但已失效」「有效」。
+
+        只报「已配置」会掩盖最常见的事故：cookie 过期后 B站仍返回 HTTP 200
+        （code=-101），插件一路按匿名额度跑、412 频发，而状态命令一片安好。
+        """
+        if not self.config.bilibili.sessdata:
+            return "未配置（匿名，音质≤64k）"
+        api = self._get_api()
+        state = getattr(api, "bili_login_state", None)
+        if state is False:
+            return "已配置但已失效（请更新 cookie）"
+        if state is True:
+            return "已配置且有效"
+        return "已配置（有效未验证）"
 
     @staticmethod
     def _same_dir_hint(storage: str, napcat: str) -> bool:
@@ -792,6 +1022,10 @@ class MusicRequestPlugin(MaiBotPlugin):
         旧实现会继续往下试，最终把一首完全无关的歌播出去（真机实锤）。
         这里用相对地板把不同档的候选剔掉，宁可报「没找到可播放的」也不要放错。
 
+        注意：不因「只有一条候选」而跳过——单结果旁路是相关度过滤的漏洞
+        （地板只在多候选时生效，平台只返回 1 条干扰项时会被无条件播出）。
+        单结果过一遍排序/地板不亏（`rank_songs` 对单条恒保留）。
+
         Args:
             query: 用户查询串（通常是「歌名」或「歌名 歌手」）。
             results: 平台返回的候选列表。
@@ -799,8 +1033,6 @@ class MusicRequestPlugin(MaiBotPlugin):
         Returns:
             过滤后的候选，按相关度降序。
         """
-        if len(results) <= 1:
-            return list(results)
         ranked = rank_songs(
             query, results, floor_ratio=float(self.config.music.relevance_floor)
         )
@@ -812,6 +1044,230 @@ class MusicRequestPlugin(MaiBotPlugin):
                 len(dropped), query, len(kept), len(results), "; ".join(dropped[:3]),
             )
         return kept
+
+    async def _vcpedia_pinned_song(
+        self, keyword: str, trigger_text: str = ""
+    ) -> Optional[SongInfo]:
+        """向 cv_lyric_context 查原曲 B站标识，命中则直接构造候选。
+
+        为什么值得短路搜索：B站搜索会返回翻唱 / 现场 / 串烧 / 搬运一堆同名
+        片源，相关度排序只能剔除明显无关的，**无法保证播的是原曲**；而 VCPedia
+        词条信息框里的 `bb_id` 由编辑者维护，指的就是原曲投稿。
+
+        只在**整串关键词**命中曲库时才生效：用户说「普通DISCO 三无」时库里
+        没有这个组合，自然回退搜索——不会把想听翻唱的人钉在原曲上。
+
+        Args:
+            keyword: 点歌查询串。
+            trigger_text: 用户本条消息的**原话**。用来区分「查询串里的歌手是
+                用户自己说的」还是「模型/上游注入补的」——后者不该否决原曲。
+                为空时无法判断，按保守策略处理（回退搜索）。
+
+        任何异常（插件未安装 / 未启用 / API 不兼容 / 超时）都静默返回 None，
+        绝不阻塞点歌主链路。
+
+        Returns:
+            命中原曲时返回单元素候选（`song_id` 为 BV 号或 `av<N>`），
+            否则 None。
+        """
+        if not self.config.bilibili.vcpedia_lookup:
+            return None
+        query = (keyword or "").strip()
+        if not query:
+            return None
+        try:
+            result = await self.ctx.api.call(
+                f"{VCPEDIA_PLUGIN_ID}.get_song_bilibili", name=query
+            )
+        except AttributeError:
+            # 老版本 Host 没有 ctx.api 能力代理（SDK 2.1.0 才引入 @API/代理）
+            self.ctx.logger.debug("当前 Host 不支持跨插件 API 调用，跳过 VCPedia 查询")
+            return None
+        except Exception as exc:  # noqa: BLE001 - 缺插件/超时都不该打断点歌
+            self.ctx.logger.info("VCPedia 曲库查询不可用，回退搜索（%s）: %r", query, exc)
+            return None
+        if not isinstance(result, dict) or not result.get("found"):
+            return None
+        match = str(result.get("match") or "")
+        if match == "prefix":
+            # 查询串里带了歌名之外的 token（通常是歌手）。分三种情况：
+            #
+            #   1. 该 token 是**原曲歌手**（「世末积雨云 洛天依」）→ 用户要的就是原曲，采纳；
+            #   2. 该 token **不在用户原话里** → 是模型/上游注入补的噪声，不该否决原曲，采纳；
+            #      真机 2026-10-22 21:48：用户只说「放一首世末歌者」，query 却是
+            #      「世末歌者 洛天依」（洛天依既非原曲歌手乐正绫、用户也没提），
+            #      一刀切否决后三个平台全搜不到；
+            #   3. 其余（用户自己说了个非原曲歌手）→ 点名翻唱，回退搜索。
+            extra = _prefix_extra_text(query, str(result.get("name") or ""))
+            singers = result.get("singers") or []
+            adopt = False
+            reason = ""
+            if extra and _mentions_any_name(extra, singers):
+                adopt, reason = True, "额外 token 是原曲歌手"
+            elif extra and trigger_text and not _appears_in_text(extra, trigger_text):
+                adopt, reason = True, "额外 token 不在用户原话里（模型自行补充的噪声）"
+            elif not extra:
+                adopt, reason = True, "无额外 token"
+            if adopt:
+                self.ctx.logger.info(
+                    "VCPedia 前缀命中「%s」→ 采纳原曲（%s）", query, reason
+                )
+            else:
+                self.ctx.logger.info(
+                    "VCPedia 仅按前缀命中「%s」（额外 token=%r 是用户点名的非原曲歌手），"
+                    "改走平台搜索",
+                    query, extra,
+                )
+                return None
+        bvid = str(result.get("bvid") or "").strip()
+        aid = result.get("aid")
+        if bvid:
+            song_id = bvid
+        elif aid:
+            # av 号原样带前缀，get_video_cid 会归一化成 aid 参数
+            song_id = f"av{aid}"
+        else:
+            self.ctx.logger.info(
+                "VCPedia 命中「%s」但尚未采集 B站标识，回退搜索", query
+            )
+            return None
+        display = str(result.get("name") or query).strip() or query
+
+        # 时长闸：曲库的 duration 字段实测 100% 为空，只能现场查 pagelist
+        # （顺带把 cid 缓存住，后续取流不再重复请求，不额外花时间）。
+        # 超过 `_VCPEDIA_MAX_DIRECT_SECONDS` 就不直连——那首注定传不完，
+        # 直连只会让用户白等 50 秒再失败，不如立刻回退平台搜索。
+        duration = await self._probe_bili_duration(song_id)
+        if duration is not None and duration > _VCPEDIA_MAX_DIRECT_SECONDS:
+            self.ctx.logger.info(
+                "VCPedia 命中原曲但时长 %ds 超过直连上限 %ds，改走平台搜索: %s",
+                duration, _VCPEDIA_MAX_DIRECT_SECONDS, display,
+            )
+            return None
+
+        self.ctx.logger.info(
+            "VCPedia 命中原曲，跳过 B站搜索: %s -> %s", display, song_id
+        )
+        return SongInfo(song_id=song_id, name=display, platform=PLATFORM_BILI)
+
+    async def _probe_bili_duration(self, video_id: str) -> Optional[int]:
+        """查 B站视频总时长（秒）；B站未启用或查不到返回 None。
+
+        失败一律当成「不知道时长」放行——宁可多试一次直连，也不要因为
+        探测接口抽风就把本来能播的歌挡掉。
+        """
+        try:
+            api = self._get_api()
+        except Exception as exc:  # noqa: BLE001 - 探测失败不影响主链路
+            self.ctx.logger.debug("构造 API 客户端失败，跳过时长探测: %r", exc)
+            return None
+        try:
+            return await api.bili_duration(video_id)
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.debug("查 B站时长失败（%s）: %r", video_id, exc)
+            return None
+
+    async def _search_ranked(self, keyword: str, platform: str) -> List[SongInfo]:
+        """搜索 → 歌手校验 → 相关度排序；点名歌手却无人命中时按歌名重搜一次。
+
+        真机实锤（2026-10-20）：query="但我讨厌摇滚乐 洛天依" 整串丢给
+        网易云搜索，被「洛天依」token 带偏返回 5 条无关候选，洛天依版
+        根本不在里面；排序给《我最讨厌摇滚乐 - 显然乐队》0.6 的字符覆盖
+        分让它成为幸存者并被播出。修法三段：
+
+        1. 歌手硬过滤：候选里有 artists 命中查询 token 的（证明平台能
+           返回该歌手的版本），不命中的全部剔除（artists 为空豁免）；
+        2. 歌名重搜：query 多 token 且首轮候选不可信（没有候选命中歌手
+           token，或最佳标题分低于可信线——后者覆盖「同专辑同歌手错歌」
+           形态：《为六弦琴而作 - 停電前夜, 洛天依》歌手命中但根本不是
+           那首歌）时，用歌名 token 重搜一次，合并去重后重新判定；
+        3. 可信线守卫：首轮被判不可信的多 token query，最终候选的最佳
+           标题分仍低于可信线（`TITLE_CREDIBILITY_LINE`，字符覆盖凑分
+           的干扰项形态）就返回空列表报失败——宁报失败不放错歌。
+
+        Args:
+            keyword: 用户查询串（通常是「歌名 歌手」）。
+            platform: 已解析的平台标识。
+
+        Returns:
+            排序过滤后的候选；不可信时为空列表。
+        """
+        # B站优先查 VCPedia 曲库的权威原曲标识：命中就跳过搜索，
+        # 既避开搜索风控，也彻底消除「播成翻唱/现场版」的可能。
+        if platform == PLATFORM_BILI:
+            pinned = await self._vcpedia_pinned_song(keyword)
+            if pinned is not None:
+                return [pinned]
+        results = await self._search(keyword, platform)
+        matched, neutral, unmatched = split_by_artist_match(keyword, results)
+        if matched and unmatched:
+            self.ctx.logger.info(
+                "歌手校验剔除 %d 个候选（query=%r 保留 %d/%d）: %s",
+                len(unmatched), keyword, len(matched) + len(neutral), len(results),
+                "; ".join(song.display() for song in unmatched[:3]),
+            )
+            pool = matched + neutral
+        else:
+            # 全命中（无从剔）或全不命中（歌手意图未证实，交给重搜判定）
+            pool = list(results)
+
+        title_token = title_retry_token(keyword)
+        best_first = max((score_song(keyword, song) for song in results), default=0.0)
+        # 首轮候选不可信的两种形态 → 按歌名重搜一次：
+        # a) 没有任何候选命中歌手 token（歌手意图未证实 / 搜索被带偏）；
+        # b) 最佳标题分低于可信线——同专辑同歌手的错歌（歌手命中但
+        #    标题只有字符覆盖凑分）也走这里。
+        need_retry = bool(title_token) and (
+            not matched or best_first < TITLE_CREDIBILITY_LINE
+        )
+        if need_retry:
+            try:
+                retry_results = await self._search(title_token, platform)
+            except Exception:
+                # 重搜是兜底不是主路：失败就沿用首轮候选，别把整条链路拖死
+                self.ctx.logger.warning(
+                    "按歌名重搜失败(%s): %r", platform, title_token, exc_info=True
+                )
+            else:
+                merged = self._merge_song_results(results, retry_results)
+                matched2, neutral2, unmatched2 = split_by_artist_match(keyword, merged)
+                if matched2:
+                    self.ctx.logger.info(
+                        "按歌名 %r 重搜后命中歌手 %d/%d，剔除: %s",
+                        title_token, len(matched2), len(merged),
+                        "; ".join(song.display() for song in unmatched2[:3]),
+                    )
+                    pool = matched2 + neutral2
+                else:
+                    pool = merged
+
+        # 可信线守卫（仅多 token query）：首轮已被判不可信时，最终候选
+        # 若仍凑不出「配得上是那首歌」的标题分，宁报失败也不播干扰项。
+        if title_token and best_first < TITLE_CREDIBILITY_LINE:
+            best_final = max((score_song(keyword, song) for song in pool), default=0.0)
+            if best_final < TITLE_CREDIBILITY_LINE:
+                self.ctx.logger.info(
+                    "候选不可信（query=%r 平台=%s 首轮最佳 %.2f 终选最佳 %.2f "
+                    "< 可信线 %.2f），宁报失败不放错歌",
+                    keyword, platform, best_first, best_final, TITLE_CREDIBILITY_LINE,
+                )
+                return []
+        return self._rank_results(keyword, pool)
+
+    @staticmethod
+    def _merge_song_results(
+        primary: List[SongInfo], retry: List[SongInfo]
+    ) -> List[SongInfo]:
+        """合并两轮搜索结果并去重（平台 + song_id + 歌名三元组）。"""
+        seen: set = set()
+        merged: List[SongInfo] = []
+        for song in [*primary, *retry]:
+            key = (song.platform, song.song_id, song.name)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(song)
+        return merged
 
     def _format_results(self, results: List[SongInfo], title: str = "搜索结果") -> str:
         """把搜索结果格式化成供用户选歌的列表。"""
@@ -1059,14 +1515,31 @@ class MusicRequestPlugin(MaiBotPlugin):
 
     async def _degrade_to_card(
         self, song: SongInfo, stream_id: str, *, silent: bool, reason: str,
-        outcome: Dict[str, str] | None = None,
+        outcome: Dict[str, str] | None = None, degrade: str = "card",
     ) -> bool:
-        """文件形态不可用时降级为音乐卡片。
+        """文件形态不可用时的降级出口。
 
-        刻意**不降级为语音**：用户选文件图的就是音质，而语音会把音质打到
-        SILK 级别。卡片由官方播放器播放，是仅次于文件的形态。
-        降级必须留痕（日志 + 可选的用户提示 + 工具返回文本），否则就变成静默换形态。
+        `degrade="card"`（默认）：降级为音乐卡片。刻意**不降级为语音**：
+        用户选文件图的就是音质，而语音会把音质打到 SILK 级别；卡片由官方
+        播放器播放，是仅次于文件的形态。
+
+        `degrade="text"`（B站）：只发文本提示并返回失败。B站视频构不了
+        音乐平台卡片，把「视频页面链接卡片」伪装成音乐卡片属于静默换形态；
+        宁可让用户看到「发不了」，也不要让他们以为拿到了同等的播放形态。
+        降级必须留痕（日志 + 可选的用户提示 + 工具返回文本）。
         """
+        if degrade == "text":
+            self.ctx.logger.warning(
+                "文件形态不可用（B站只发文件，不降级）: %s（%s）", song.display(), reason
+            )
+            if outcome is not None:
+                outcome["kind"] = "text_degraded"
+                outcome["reason"] = reason
+            if not silent:
+                await self.ctx.send.text(
+                    f"「{song.display()}」暂时发不了音频文件（{reason}）", stream_id
+                )
+            return False
         self.ctx.logger.warning("文件形态不可用，降级为音乐卡片: %s（%s）", song.display(), reason)
         if outcome is not None:
             outcome["kind"] = "card_degraded"
@@ -1075,15 +1548,48 @@ class MusicRequestPlugin(MaiBotPlugin):
             await self.ctx.send.text(f"暂时发不了文件（{reason}），已改为发送音乐卡片", stream_id)
         return await self._send_card(song, stream_id, silent=True)
 
+    async def _acquire_upload_slot(
+        self, guard: asyncio.Lock, budget: Optional[float]
+    ) -> bool:
+        """尝试拿上传槽位，**有等待上限**；超时返回 False。
+
+        为什么必须设上限：`_send_file` 用 `_cache_guard` 串行化了整个
+        「取直链 → 下载 → 上传」流程（本意是保护缓存重建）。串行本身是对的——
+        并发上传会平分带宽，两个都超时；但**后来者不能死等前一个的完整上传**：
+        前一个用满 50s，后来者再等 50s 才轮到，叠加必然超 Host 的 60s RPC
+        预算，触发 2026-09-26 那种僵尸调用（工具结果送不回模型，Host 重试
+        导致同一文件传多遍）。
+
+        等待上限取预算的 30%，并夹在 [3, 15] 秒之间。
+        """
+        base = float(budget) if budget else 60.0
+        wait = max(3.0, min(15.0, base * 0.3))
+        try:
+            await asyncio.wait_for(guard.acquire(), timeout=wait)
+            return True
+        except asyncio.TimeoutError:
+            self.ctx.logger.warning(
+                "等待上传槽位超时（%.0fs），放弃本次发送以避免超时叠加", wait
+            )
+            return False
+
     async def _send_file(
         self, song: SongInfo, stream_id: str, *, silent: bool = False,
-        outcome: Dict[str, str] | None = None,
+        outcome: Dict[str, str] | None = None, degrade: str = "card",
+        upload_timeout_seconds: float | None = None,
     ) -> bool:
         """把歌曲作为「群文件 / 私聊文件」发送，完整保留原始音质。
 
         这是唯一能绕开 QQ 语音转码（SILK ≈ 6–12 kbps + 60 秒上限）的形态：
         文件原样上传，用户下载后用播放器听。代价是必须有 NapCat HTTP API，
         且 NapCat 要能读到缓存文件（与语音本地缓存同一个前提，用 `/点歌自检` 核对）。
+
+        `degrade`：不可用时的降级出口——`"card"`（平台歌曲，默认）或 `"text"`
+        （B站，构不了卡片，宁报失败不静默换形态）。
+
+        `upload_timeout_seconds`：NapCat 上传超时覆盖。LLM 工具路径必须传
+        Host invoke_tool 预算（60s）以内的值，否则工具结果送不回模型、
+        还会留下僵尸调用重复传文件（真机实锤 2026-09-26，本地库路径同因）。
         """
         api = self._get_api()
         target = await self._resolve_qq_target(stream_id)
@@ -1091,14 +1597,20 @@ class MusicRequestPlugin(MaiBotPlugin):
             return await self._degrade_to_card(
                 song, stream_id, silent=silent,
                 reason="未配置 NapCat HTTP API 或拿不到群号/QQ号", outcome=outcome,
+                degrade=degrade,
             )
 
         guard = self._run_lock("_cache_guard")
-        async with guard:
+        if not await self._acquire_upload_slot(guard, upload_timeout_seconds):
+            # 槽位拿不到就快速失败，不降级、不发言——上层会继续下一个候选/平台。
+            # 死等前一个上传会把自己的预算耗尽，比失败更糟。
+            return False
+        try:
             cache = self._cache
             if cache is None:
                 return await self._degrade_to_card(
-                    song, stream_id, silent=silent, reason="音频缓存未启用", outcome=outcome,
+                    song, stream_id, silent=silent, reason="音频缓存未启用",
+                    outcome=outcome, degrade=degrade,
                 )
 
             media_id = song.media_id
@@ -1123,19 +1635,37 @@ class MusicRequestPlugin(MaiBotPlugin):
             if not audio_url:
                 if outcome is not None:
                     outcome["kind"] = "unavailable"
+                # B站失败必须带原因：412 风控 / SESSDATA 失效 / 视频被删 /
+                # dash 缺音频轨，四种故障处置完全不同，折叠成一句
+                # 「未返回可用音频」等于让线上无法归因（真机 2026-10-21）。
+                reason = ""
+                if song.platform == PLATFORM_BILI:
+                    reason = api.bili_last_error
+                    if reason:
+                        self.ctx.logger.warning(
+                            "B站取流失败原因: bvid=%s %s", song.song_id, reason
+                        )
+                        if outcome is not None:
+                            outcome["reason"] = reason
                 if not silent:
-                    await self.ctx.send.text(
-                        f"找到「{song.display()}」但音乐平台未返回可用音频", stream_id
-                    )
+                    message = f"找到「{song.display()}」但音乐平台未返回可用音频"
+                    if reason:
+                        message += f"（{reason[:100]}）"
+                    await self.ctx.send.text(message, stream_id)
                 return False
 
             try:
-                path = await cache.get_or_download(song.platform, song.song_id, audio_url)
+                # B站音频轨容器即 m4a，但 URL 路径以 .m4s 结尾（不在白名单后缀里），
+                # 按 URL 推断会错落成 .mp3——必须显式指定后缀
+                suffix = ".m4a" if song.platform == PLATFORM_BILI else ""
+                path = await cache.get_or_download(
+                    song.platform, song.song_id, audio_url, suffix=suffix
+                )
                 cache.retain(path)
             except AudioCacheError as exc:
                 return await self._degrade_to_card(
                     song, stream_id, silent=silent,
-                    reason=f"音频下载失败（{exc}）", outcome=outcome,
+                    reason=f"音频下载失败（{exc}）", outcome=outcome, degrade=degrade,
                 )
 
             try:
@@ -1145,10 +1675,13 @@ class MusicRequestPlugin(MaiBotPlugin):
                 display = song.display().strip() or path.stem
                 file_name = f"{display}{path.suffix}"
                 ok, _data = await api.napcat_upload_file(
-                    napcat_path, name=file_name, **target
+                    napcat_path, name=file_name, **target,
+                    timeout_seconds=upload_timeout_seconds,
                 )
             finally:
                 cache.release(path)
+        finally:
+            guard.release()
 
         if ok:
             self.ctx.logger.info("已作为文件发送: %s（%s）", file_name, napcat_path)
@@ -1159,7 +1692,8 @@ class MusicRequestPlugin(MaiBotPlugin):
                 await self.ctx.send.text(f"已发送文件：{file_name}", stream_id)
             return True
         return await self._degrade_to_card(
-            song, stream_id, silent=silent, reason="NapCat 上传失败", outcome=outcome,
+            song, stream_id, silent=silent, reason="NapCat 上传失败",
+            outcome=outcome, degrade=degrade,
         )
 
     async def _send_song(
@@ -1180,8 +1714,23 @@ class MusicRequestPlugin(MaiBotPlugin):
                 song, stream_id, silent=silent, mode=mode, outcome=outcome,
                 upload_timeout_seconds=upload_timeout_seconds,
             )
+        if song.platform == PLATFORM_BILI:
+            # B站固定文件形态：m4a 音频喂给语音通道会被 QQ 转码 SILK 且 60 秒截断，
+            # 卡片又构不了（没有平台歌曲 ID）——唯一合理形态就是原样发文件。
+            # NapCat / 缓存不可用时按「文本提示」收场，不静默换成劣化形态。
+            if resolved != "file":
+                self.ctx.logger.info(
+                    "B站音频固定以文件形态发送（请求形态=%s 已覆盖）", resolved
+                )
+            return await self._send_file(
+                song, stream_id, silent=silent, outcome=outcome, degrade="text",
+                upload_timeout_seconds=upload_timeout_seconds,
+            )
         if resolved == "file":
-            return await self._send_file(song, stream_id, silent=silent, outcome=outcome)
+            return await self._send_file(
+                song, stream_id, silent=silent, outcome=outcome,
+                upload_timeout_seconds=upload_timeout_seconds,
+            )
         if outcome is not None:
             outcome["kind"] = "voice" if resolved == "voice" else "card"
         if resolved == "voice":
@@ -1195,16 +1744,50 @@ class MusicRequestPlugin(MaiBotPlugin):
         api = self._get_api()
         return await api.search(query, platform, limit=int(self.config.music.search_limit))
 
-    async def _search_and_send(self, query: str, platform: str, stream_id: str) -> Tuple[bool, str]:
-        """搜索并按「单首直发 / 多首列候选」策略发送（命令与卡片解析共用）。"""
+    async def _search_and_send(
+        self, query: str, platform: str, stream_id: str, trigger_text: str = ""
+    ) -> Tuple[bool, str]:
+        """搜索并按「单首直发 / 多首列候选」策略发送（命令与卡片解析共用）。
+
+        Args:
+            query: 搜索串。
+            platform: 用户显式指定的平台（空串 = 未指定）。
+            stream_id: 目标会话。
+            trigger_text: 用户原话，用于区分查询串里的歌手是用户说的还是模型补的。
+        """
+        # 命令路径通常能直接拿到原话；拿不到时同样回退到入站缓存，
+        # 保证两条路径的校验基准一致。
+        if not trigger_text:
+            trigger_text = self._inbound_text.get(stream_id)
         resolved = self._resolve_platform(platform)
+        if resolved == PLATFORM_BILI and not self.config.bilibili.enabled:
+            message = "B站平台未启用，请在插件配置里开启 bilibili.enabled"
+            await self.ctx.send.text(message, stream_id)
+            return False, message
         try:
-            results = await self._search(query, resolved)
+            # 未显式指定平台时，先看 VCPedia 曲库有没有这首的原曲——与工具路径
+            # 同一决策（翻唱版算放错歌）。显式 `/点歌 bili|qq|163` 一律尊重用户。
+            pinned = None
+            if (
+                not str(platform or "").strip()
+                and resolved != PLATFORM_BILI
+                and self.config.bilibili.enabled
+            ):
+                pinned = await self._vcpedia_pinned_song(query, trigger_text)
+            if pinned is not None:
+                results = [pinned]
+            else:
+                # 与工具路径同一条链路：搜索 → 歌手校验 →（必要时按歌名重搜）
+                # → 相关度排序。列表顺序直接影响用户选到哪首，必须先过滤再列候选。
+                results = await self._search_ranked(query, resolved)
         except MusicAPIResponseError as exc:
-            # 只有 QQ音乐缺登录态时给出可操作的下一步提示
+            # 只有平台缺登录态/被风控时给出可操作的下一步提示
             if resolved == PLATFORM_QQ and "缺少配置" in str(exc):
                 self.ctx.logger.warning("QQ音乐搜索不可用: %s", exc)
                 message = "QQ音乐搜索需要先配置 qq.uin 与 qqmusic_key，或改用 /点歌 163 <歌曲名>"
+            elif resolved == PLATFORM_BILI and "风控" in str(exc):
+                self.ctx.logger.warning("B站搜索被风控: %s", exc)
+                message = "B站搜索暂时被限流（风控），请稍后再试；配置 bilibili.sessdata 可降低概率"
             else:
                 self.ctx.logger.error("音乐搜索失败: %s", exc.diagnostic())
                 message = "搜索歌曲时出错，请稍后再试"
@@ -1215,9 +1798,6 @@ class MusicRequestPlugin(MaiBotPlugin):
             message = "搜索歌曲时出错，请稍后再试"
             await self.ctx.send.text(message, stream_id)
             return False, message
-
-        # 先按相关度排序再决定「直发还是列候选」：列表顺序直接影响用户选到哪首
-        results = self._rank_results(query, results)
 
         if not results:
             message = f"在{self._platform_name(resolved)}上没找到「{query}」"
@@ -1323,6 +1903,10 @@ class MusicRequestPlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         """插件加载：初始化并发原语与音频缓存。"""
+        # 日志脱敏必须先装：插件手握三套凭据（网易云 MUSIC_U、QQ uin+qqmusic_key、
+        # B站 SESSDATA），而 `logger.exception()` 会把异常消息原样打进日志——
+        # 适配器抛的异常里可能内嵌它请求时用的 cookie 串。
+        install_secret_scrubber(self.ctx.logger)
         self._run_lock("_cache_guard")
         try:
             await self._start_cache()
@@ -1331,7 +1915,7 @@ class MusicRequestPlugin(MaiBotPlugin):
         # 行为自检：把生效配置打进启动日志，真机排障时一眼可见
         self.ctx.logger.info(
             "点歌插件已加载 version=%s enabled=%s platform=%s mode=%s voice_source=%s "
-            "prefix=%s 网易云登录=%s QQ音乐登录=%s NapCat直连=%s 本地歌曲库=%s",
+            "prefix=%s 网易云登录=%s QQ音乐登录=%s B站=%s NapCat直连=%s 本地歌曲库=%s",
             SUPPORTED_CONFIG_VERSION,
             self.config.plugin.enabled,
             self.config.music.default_platform,
@@ -1340,6 +1924,7 @@ class MusicRequestPlugin(MaiBotPlugin):
             self.config.music.command_prefix,
             bool(self.config.netease.music_u),
             bool(self.config.qq.uin and self.config.qq.qqmusic_key),
+            f"enabled={self.config.bilibili.enabled} sessdata={bool(self.config.bilibili.sessdata)}",
             bool(self.config.napcat.http_url),
             bool(self._get_library()),
         )
@@ -1382,10 +1967,11 @@ class MusicRequestPlugin(MaiBotPlugin):
 
     @Command(
         "点歌",
-        description="搜索点歌，可用 /点歌 [163|qq] <歌曲名> 指定平台",
+        description="搜索点歌，可用 /点歌 [163|qq|bili] <歌曲名> 指定平台",
         pattern=(
             _PFX + r"\s*点歌"
-            r"(?:\s+(?P<platform>163|qq|网易云音乐|网易云|网易|netease|qq音乐|qqmusic))?"
+            r"(?:\s+(?P<platform>163|qq|网易云音乐|网易云|网易|netease|qq音乐|qqmusic"
+            r"|bilibili|bili|[Bb]站|哔哩哔哩))?"
             r"\s+(?P<query>.+?)\s*$"
         ),
     )
@@ -1411,11 +1997,14 @@ class MusicRequestPlugin(MaiBotPlugin):
 
         if not query:
             await self.ctx.send.text(
-                f"用法：{self.config.music.command_prefix}点歌 [163|qq] <歌曲名>", stream_id
+                f"用法：{self.config.music.command_prefix}点歌 [163|qq|bili] <歌曲名>", stream_id
             )
             return False, "缺少歌曲名", 0
 
-        ok, message = await self._search_and_send(query, str(groups.get("platform") or ""), stream_id)
+        ok, message = await self._search_and_send(
+            query, str(groups.get("platform") or ""), stream_id,
+            trigger_text=self._extract_text(kwargs),
+        )
         return ok, message, 2
 
     @Command(
@@ -1488,6 +2077,11 @@ class MusicRequestPlugin(MaiBotPlugin):
             f"网易云登录: {'已配置' if self.config.netease.music_u else '未配置（仅免费/低音质）'}",
             "QQ音乐登录: "
             + ("已配置" if self.config.qq.uin and self.config.qq.qqmusic_key else "未配置（搜索不可用）"),
+            "B站平台: "
+            + ("已启用" if self.config.bilibili.enabled else "未启用")
+            + "（SESSDATA: "
+            + self._bili_sessdata_state()
+            + f"；时长上限 {self.config.bilibili.max_duration_seconds}s）",
             f"NapCat 直连: {'已配置' if self.config.napcat.http_url else '未配置'}",
             f"解析链接/卡片: {self.config.music.auto_parse_url}/{self.config.music.auto_parse_card}",
         ]
@@ -1698,6 +2292,12 @@ class MusicRequestPlugin(MaiBotPlugin):
             )
         if kind == "unavailable":
             return f"找到「{display}」但音乐平台未返回可用音频"
+        if kind == "text_degraded":
+            reason = outcome.get("reason") or "发送不可用"
+            return (
+                f"歌曲「{display}」原本要发音频文件，但发送失败（{reason}），本次没有发送。"
+                "请如实告知用户，不要谎称已发送。"
+            )
         if kind == "card":
             return f"已以音乐卡片发送: {display}"
         return f"已播放: {display}"
@@ -1710,7 +2310,9 @@ class MusicRequestPlugin(MaiBotPlugin):
             "用户贴了歌词、正在聊某首歌并表示想听（如「放一下」「来一段」「我想听」）时也用这个工具。"
             "**默认不要传 send_as**，插件会按配置的默认形态发送；"
             "只有用户本条消息里明确要求「发文件 / 无损 / 要好音质」时才传 send_as=file。"
-            "不要指定平台，插件会自动选可用平台并逐首尝试候选。"
+            "**默认也不要传 platform**，插件会自动选平台并逐首尝试候选；"
+            "只有用户本条消息**明确指定了平台**（「用B站放」「去网易云搜」「QQ音乐上放」）"
+            "时才填 platform。"
             "若启用了本地歌曲库，本工具会优先在本地库里找（返回文本带「来自本地歌曲库」标记），"
             "没命中再搜音乐平台。\n"
             "本工具已内置换源与重试；若返回播放失败，不要重复调用，直接告诉用户即可。"
@@ -1747,10 +2349,19 @@ class MusicRequestPlugin(MaiBotPlugin):
                 ),
                 required=False,
             ),
+            ToolParameterInfo(
+                name="platform",
+                param_type=ToolParamType.STRING,
+                description=(
+                    "一般留空。仅当用户本条消息明确指定平台时才填："
+                    "bili（B站/哔哩哔哩）、163（网易云）、qq（QQ音乐）"
+                ),
+                required=False,
+            ),
         ],
     )
     async def search_and_play_music(
-        self, query: str = "", send_as: str = "", **kwargs: Any
+        self, query: str = "", send_as: str = "", platform: str = "", **kwargs: Any
     ) -> Dict[str, Any]:
         """LLM 点歌：直发最佳匹配，失败自动换平台。"""
         stream_id = self._extract_stream_id(kwargs)
@@ -1770,6 +2381,11 @@ class MusicRequestPlugin(MaiBotPlugin):
         # 不含用户表达，按「拿不到触发文本」处理，从而尊重调用方入参
         if trigger_text and _RE_PLACEHOLDER_ONLY.match(trigger_text.strip()):
             trigger_text = ""
+        # 工具载荷里通常**没有**用户原话（只有 query/send_as/platform/stream_id），
+        # 而参数可信度校验必须以原话为基准——回退到入站钩子登记的最近一条文本。
+        # 真机 2026-10-22 22:27：这里一直是空，导致 platform 与歌手校验全部静默失效。
+        if not trigger_text:
+            trigger_text = self._inbound_text.get(stream_id)
         # 代码层兜底（双向）：
         # 1) 触发消息明确要「文件/无损/好音质」→ 强制 file，
         #    不依赖 LLM 自觉传 send_as（LongCat 实测会漏传）；
@@ -1829,13 +2445,72 @@ class MusicRequestPlugin(MaiBotPlugin):
                     tracks[0].name, local_outcome.get("reason", "未知"),
                 )
 
-        default = self._resolve_platform("")
-        platforms = [default, PLATFORM_QQ if default == PLATFORM_NETEASE else PLATFORM_NETEASE]
+        # ── VCPedia 原曲优先 ──
+        # 产品决策（2026-10-22，用户确认「翻唱版也算放错歌」）：曲库命中就直连
+        # 原曲投稿，不让网易云/QQ 的翻唱版抢在前面。这是**纠错**而非兜底——
+        # 如果放在平台链末尾，用户听到的永远是平台给的第一条。
+        #
+        # 触发条件收紧（都不是默认成立，需要逐条满足）：
+        #   1. `bilibili.enabled` 且 `bilibili.vcpedia_lookup` 开着；
+        #   2. 曲库确实收录了这首且已采集 B站标识（否则返回 None，走平台链）；
+        #   3. 只接受 exact / base 命中——带歌手的多 token 查询不算
+        #      （见 _vcpedia_pinned_song 的 prefix 过滤）。
+        # 用户是否**显式**指定了平台（「用B站放」「去网易云搜」）。
+        # 这是 LLM 工具新增 platform 参数的原因：真机 2026-10-22 用户说
+        # 「用b站放世末积雨云」，工具没有表达平台的入口，平台意图被整个丢掉，
+        # 结果在网易云播了「洛天依ACE Studio Cover」翻唱版。
+        explicit = self._try_explicit_platform(platform)
+        # 参数可信度校验：LLM 可能在没有依据的情况下自己填 platform。
+        # 有用户原话时以原话为准——原话没提平台，这个参数就是幻觉，忽略它
+        # （忽略后会走完整平台链 + VCPedia 优先，比被绑死在单一平台上更安全）。
+        # 拿不到原话（非聊天触发的直接调用）时信任显式参数。
+        if explicit and trigger_text and not _platform_alias_in_text(trigger_text, explicit):
+            self.ctx.logger.info(
+                "工具传了 platform=%r 但用户原话未提及平台，忽略该参数: %.60s",
+                platform, trigger_text,
+            )
+            explicit = ""
+        if explicit == PLATFORM_BILI and not self.config.bilibili.enabled:
+            return {"content": "B站平台未启用（配置 bilibili.enabled 后需完整重启），本次没有播放"}
+        if explicit:
+            self.ctx.logger.info("工具入参指定平台: %r -> %s", platform, explicit)
+
+        if self.config.bilibili.enabled and explicit in ("", PLATFORM_BILI):
+            pinned = await self._vcpedia_pinned_song(keyword, trigger_text)
+            if pinned is not None:
+                pinned_outcome: Dict[str, str] = {}
+                if await self._send_song(
+                    pinned, stream_id, silent=True, mode=mode, outcome=pinned_outcome,
+                    upload_timeout_seconds=_TOOL_NAPCAT_UPLOAD_BUDGET,
+                ):
+                    self.ctx.logger.info(
+                        "工具点歌命中 VCPedia 原曲并发送: %s", pinned.display()
+                    )
+                    return {"content": self._describe_outcome(pinned, mode, pinned_outcome)}
+                # 取流/下载失败不能断死路：继续走平台链兜底
+                self.ctx.logger.warning(
+                    "VCPedia 原曲发送失败，回退平台链: %s（%s）",
+                    pinned.display(), pinned_outcome.get("reason") or "未知",
+                )
+
+        if explicit:
+            # 用户点名了平台：只走它。跨平台重试等于违抗指令——
+            # 「用B站放」却在网易云播出来，比放不出来更糟。
+            platforms = [explicit]
+        else:
+            default = self._resolve_platform("")
+            platforms = [default, PLATFORM_QQ if default == PLATFORM_NETEASE else PLATFORM_NETEASE]
+            # B站永远排在最后当兜底：视频搜索噪音高于专业音乐平台，主攻版权缺口
+            # （中V 曲目很多 B站有投稿）；显式指定 bili 时不受此序约束。
+            if self.config.bilibili.enabled:
+                platforms.append(PLATFORM_BILI)
         failures: List[str] = []
 
         for platform in platforms:
             try:
-                results = await self._search(keyword, platform)
+                # 搜索 → 歌手校验 →（必要时按歌名重搜）→ 相关度排序，
+                # 全链路见 _search_ranked；宁可报失败也不要放错歌。
+                ranked = await self._search_ranked(keyword, platform)
             except MusicAPIResponseError as exc:
                 failures.append(f"{self._platform_name(platform)}: {exc}")
                 self.ctx.logger.warning("工具搜索失败(%s): %s", platform, exc)
@@ -1845,20 +2520,30 @@ class MusicRequestPlugin(MaiBotPlugin):
                 failures.append(f"{self._platform_name(platform)}: 异常")
                 continue
 
-            # 相关度过滤：只尝试与最佳匹配同一档的候选。
-            # 真机实锤：最佳匹配因版权拿不到音频时，旧实现会一路往下试，
-            # 最终把一首完全无关的歌播出去——宁可报失败也不要放错歌。
-            ranked = self._rank_results(keyword, results)
-
             for song in ranked:
                 outcome: Dict[str, str] = {}
                 if await self._send_song(song, stream_id, silent=True, mode=mode, outcome=outcome):
                     return {"content": self._describe_outcome(song, mode, outcome)}
+            # 搜到了但一首都没发出去：必须记进明细。此前只记「搜索抛异常」，
+            # 于是真机日志里只剩 qq 一条错误（2026-10-22 21:48），
+            # 163 与 B站 明明也参与了却完全不可见，排查只能靠猜。
+            if ranked:
+                failures.append(
+                    f"{self._platform_name(platform)}: 搜到 {len(ranked)} 首但均无法发送"
+                )
+            else:
+                failures.append(
+                    f"{self._platform_name(platform)}: 无搜索结果或候选全被过滤"
+                )
 
         self.ctx.logger.warning("工具点歌全部失败: query=%r 明细=%s", keyword, failures)
+        # 返回给模型的文案**不再罗列平台名**：这句话会进入下一轮上下文，而
+        # `已在网易云音乐、QQ音乐、B站搜索…` 会让模型误以为「用户在某个平台」，
+        # 于是下一轮主动填 platform。真机 2026-10-22 连续三次都传了 platform='qq'，
+        # 很可能就是这个文案在自我强化。平台明细留在上面的 warning 日志里。
         return {
             "content": (
-                f"已在网易云音乐和QQ音乐搜索「{keyword}」，均未取到可播放音频。"
+                f"「{keyword}」在所有可用平台均未取到可播放音频。"
                 "请不要重复调用本工具，直接告知用户当前无法播放即可。"
             )
         }
@@ -1967,6 +2652,8 @@ class MusicRequestPlugin(MaiBotPlugin):
             return {"action": "continue"}
 
         self._remember_qq_target(stream_id, target)
+        # 登记原话：工具调用载荷里没有用户消息，参数可信度校验要靠这份缓存
+        self._inbound_text.remember(stream_id, text)
 
         # ── 1. 分享卡片 ──
         if self.config.music.auto_parse_card:
@@ -2041,6 +2728,8 @@ _WEBUI_SECTION_TITLES: dict = {}
 _WEBUI_LABEL_OVERRIDES: dict = {
     "http_url": "HTTP API 地址",
     "storage_dir": "缓存目录",
+    # "buvid3 Cookie" 截断后回退成字段名本身，必须手工指定
+    "buvid3": "buvid3 Cookie",
 }
 
 

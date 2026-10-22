@@ -10,7 +10,15 @@ from __future__ import annotations
 
 import pytest
 
-from search_rank import normalize_text, rank_songs, score_song, title_score
+from search_rank import (
+    normalize_text,
+    query_tokens,
+    rank_songs,
+    score_song,
+    split_by_artist_match,
+    title_retry_token,
+    title_score,
+)
 
 
 class _Song:
@@ -184,3 +192,107 @@ def test_rank_songs_is_stable_for_equal_scores() -> None:
     second = _Song("晚安糖果罐")
     ranked = rank_songs("晚安糖果罐", [first, second], floor_ratio=0.6)
     assert [song for song, _ in ranked] == [first, second]
+
+
+# ---------- 歌手校验（真机实锤 2026-10-20） ----------
+#
+# 真机日志：query='但我讨厌摇滚乐 洛天依' 网易云返回 5 条无关候选
+#（洛天依版根本不在里面），《我最讨厌摇滚乐 - 显然乐队》靠字符覆盖
+# 0.6 分压线胜出被播出。
+
+
+# 真机日志里的实际候选形态（已匿名化第 4 条按日志截断名单还原为同形态干扰项）
+_ROCK_NOISE = _Song("我最讨厌摇滚乐", "显然乐队")
+_ROCK_GARBAGE = [
+    _Song("为六弦琴而作", "停電前夜, 洛天依"),
+    _Song("1%（给容先生）", "热水店"),
+    _Song("三字经（说唱版）", "朱习爱"),
+    _Song("我最讨厌摇滚乐", "显然乐队"),
+]
+_ROCK_TARGET = _Song("但我讨厌摇滚乐", "洛天依")
+
+
+def test_query_tokens_basic() -> None:
+    assert query_tokens("但我讨厌摇滚乐 洛天依") == ["但我讨厌摇滚乐", "洛天依"]
+    assert query_tokens("晴天，周杰伦") == ["晴天", "周杰伦"]
+    assert query_tokens("  ") == []
+    assert query_tokens(None) == []
+
+
+def test_split_artist_match_target_present_drops_mismatch() -> None:
+    """核心回归 A：目标在候选里时，歌手不匹配的干扰项必须进 unmatched。
+
+    注意《为六弦琴而作 - 停電前夜, 洛天依》歌手命中但不是那首歌——
+    它留在 matched 里，靠可信线触发重搜（见 test_music_request 端到端）。
+    """
+    matched, neutral, unmatched = split_by_artist_match(
+        "但我讨厌摇滚乐 洛天依", [*_ROCK_GARBAGE, _ROCK_TARGET]
+    )
+    assert matched == [_ROCK_GARBAGE[0], _ROCK_TARGET]
+    assert neutral == []
+    assert set(unmatched) == set(_ROCK_GARBAGE[1:])
+
+
+def test_split_artist_match_when_target_absent() -> None:
+    """真机本次实锤：整串搜索把结果带偏后，正确版本根本不在候选里；
+    唯一歌手命中的是同专辑错歌《为六弦琴而作》。"""
+    matched, neutral, unmatched = split_by_artist_match(
+        "但我讨厌摇滚乐 洛天依", _ROCK_GARBAGE
+    )
+    assert matched == [_ROCK_GARBAGE[0]]
+    assert set(unmatched) == set(_ROCK_GARBAGE[1:])
+
+
+def test_split_artist_match_empty_artists_is_exempt() -> None:
+    """artists 为空的候选无法判定，豁免进 neutral——宁放过不错杀。"""
+    blank = _Song("但我讨厌摇滚乐")
+    matched, neutral, unmatched = split_by_artist_match(
+        "但我讨厌摇滚乐 洛天依", [blank, _ROCK_NOISE]
+    )
+    assert neutral == [blank]
+    assert unmatched == [_ROCK_NOISE]
+
+
+def test_split_artist_match_multi_artist_substring_hits() -> None:
+    """多歌手 `, ` 连接、歌手名带后缀，都按子串命中。"""
+    duo = _Song("但我讨厌摇滚乐", "洛天依, 言和")
+    ace = _Song("但我讨厌摇滚乐", "洛天依ACE")
+    matched, _neutral, _unmatched = split_by_artist_match(
+        "但我讨厌摇滚乐 洛天依", [duo, ace]
+    )
+    assert matched == [duo, ace]
+
+
+def test_split_artist_match_single_token_query_makes_no_distinction() -> None:
+    """单 token（纯歌名或纯歌手）时所有候选都不命中是正常结果——
+    上层 matched 为空的闸门会保证不做硬过滤，交由重搜判定。"""
+    matched, neutral, unmatched = split_by_artist_match(
+        "但我讨厌摇滚乐", [_ROCK_NOISE, _ROCK_TARGET]
+    )
+    assert matched == []
+    assert neutral == []
+    assert set(unmatched) == {_ROCK_NOISE, _ROCK_TARGET}
+
+
+def test_split_artist_match_short_token_ignored() -> None:
+    """单字 token 不参与歌手判定（与打分逻辑同规）。"""
+    song = _Song("晴天", "阿杜")
+    matched, _neutral, unmatched = split_by_artist_match("晴天 阿", [song])
+    assert matched == []
+    assert unmatched == [song]
+
+
+def test_title_retry_token_takes_first_token() -> None:
+    """「歌名 歌手」形态取首个 token 作歌名。"""
+    assert title_retry_token("但我讨厌摇滚乐 洛天依") == "但我讨厌摇滚乐"
+
+
+def test_title_retry_token_reversed_takes_artist_name() -> None:
+    """反序查询取到的是歌手名——重搜结果仍会过校验与排序，不比不搜更糟。"""
+    assert title_retry_token("洛天依 但我讨厌摇滚乐") == "洛天依"
+
+
+def test_title_retry_token_none_for_single_or_short() -> None:
+    assert title_retry_token("晚安糖果罐") == ""
+    assert title_retry_token("") == ""
+    assert title_retry_token(None) == ""
