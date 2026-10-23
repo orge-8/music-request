@@ -30,8 +30,8 @@ def _make_plugin():
     from fakehost import FakeHost, bind_context, build_context, get_default_config
 
     plug = plugin_module.MusicRequestPlugin()
-    host = FakeHost(plugin_id="github.cateye.music-request")
-    ctx = build_context("github.cateye.music-request", rpc_call=host.rpc_call)
+    host = FakeHost(plugin_id="github.orge-8.music-request")
+    ctx = build_context("github.orge-8.music-request", rpc_call=host.rpc_call)
     bind_context(plug, ctx, get_default_config(plugin_module.MusicRequestConfig))
     return plug, host
 

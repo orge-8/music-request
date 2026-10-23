@@ -49,8 +49,8 @@ def _prepare(*, vcpedia_lookup: bool = True):
     from fakehost import FakeHost, bind_context, build_context, get_default_config
 
     plug = MusicRequestPlugin()
-    host = FakeHost(plugin_id="github.cateye.music-request")
-    ctx = build_context("github.cateye.music-request", rpc_call=host.rpc_call)
+    host = FakeHost(plugin_id="github.orge-8.music-request")
+    ctx = build_context("github.orge-8.music-request", rpc_call=host.rpc_call)
     config = get_default_config(plugin_module.MusicRequestConfig)
     config["bilibili"]["vcpedia_lookup"] = vcpedia_lookup
     bind_context(plug, ctx, config)

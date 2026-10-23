@@ -102,11 +102,11 @@ except ImportError:  # 平铺兜底：脚本直跑 / 本地测试 / 旧式加载
         parse_music_url,
     )
 
-__plugin_id__ = "github.cateye.music-request"
+__plugin_id__ = "github.orge-8.music-request"
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_CONFIG_VERSION = "1.7.4"
+SUPPORTED_CONFIG_VERSION = "1.7.6"
 
 #: 歌词曲库插件 ID —— 本插件向它查询「某首 V家曲的原曲 B站标识」。
 #: 通过跨插件只读 API `get_song_bilibili` 调用（能力 `api.call`）。

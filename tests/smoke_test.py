@@ -18,7 +18,7 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 PLUGIN_DIR = pathlib.Path(__file__).resolve().parent.parent
-PLUGIN_ID = "github.cateye.music-request"
+PLUGIN_ID = "github.orge-8.music-request"
 
 
 class StubAPI:

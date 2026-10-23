@@ -190,8 +190,8 @@ def _prepare_plugin_with_library(tmp_path: pathlib.Path, *, enabled: bool = True
     music_dir = tmp_path / "music"
     music_dir.mkdir(exist_ok=True)
     plugin = plugin_module.MusicRequestPlugin()
-    host = FakeHost(plugin_id="github.cateye.music-request")
-    ctx = build_context("github.cateye.music-request", rpc_call=host.rpc_call)
+    host = FakeHost(plugin_id="github.orge-8.music-request")
+    ctx = build_context("github.orge-8.music-request", rpc_call=host.rpc_call)
     config = get_default_config(plugin_module.MusicRequestConfig)
     config["music"]["play_mode"] = "card"  # 库发送形态不受全局 play_mode 影响
     config["music"]["voice_source"] = "remote"

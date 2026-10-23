@@ -1,4 +1,4 @@
-"""点歌插件（github.cateye.music-request）。
+"""点歌插件（github.orge-8.music-request）。
 
 本包的模块划分：
     plugin.py       入口、配置模型、生命周期、Command/Tool/Hook 组件
