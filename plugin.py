@@ -72,6 +72,7 @@ try:  # 包式加载优先（Runner 主路径）：模块挂到 <插件名>.* �
         extract_urls,
         parse_music_card_text,
         parse_music_url,
+        strip_card_injected_text,
     )
 except ImportError:  # 平铺兜底：脚本直跑 / 本地测试 / 旧式加载
     from audio_cache import AudioCacheError, MusicAudioCache, write_cache_probe
@@ -100,13 +101,14 @@ except ImportError:  # 平铺兜底：脚本直跑 / 本地测试 / 旧式加载
         extract_urls,
         parse_music_card_text,
         parse_music_url,
+        strip_card_injected_text,
     )
 
 __plugin_id__ = "github.orge-8.music-request"
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_CONFIG_VERSION = "1.7.6"
+SUPPORTED_CONFIG_VERSION = "1.7.7"
 
 #: 歌词曲库插件 ID —— 本插件向它查询「某首 V家曲的原曲 B站标识」。
 #: 通过跨插件只读 API `get_song_bilibili` 调用（能力 `api.call`）。
@@ -2696,7 +2698,21 @@ class MusicRequestPlugin(MaiBotPlugin):
         if not self.config.music.auto_parse_url:
             return {"action": "continue"}
 
-        for url in extract_urls(text):
+        # 卡片解析关闭时，只认「用户自己打进来的链接」。
+        # 统一 QQ 连接器会把卡片的 jumpUrl 拼回正文
+        # （`[QQ音乐] 歌名 - 歌手 链接: <jumpUrl>`，见适配器
+        # codecs/inbound/cards.py::_build_music_card_segments），
+        # 若对整段直接 extract_urls，卡片内附链接会被当成用户输入解析，
+        # 于是关掉 auto_parse_card 也照样发歌（真机 2026-11-04 报障）。
+        link_text = text
+        if not self.config.music.auto_parse_card:
+            link_text = strip_card_injected_text(text)
+            if link_text != text:
+                self.ctx.logger.info(
+                    "auto_parse_card=off，已忽略卡片内附链接；用户正文=%r", link_text
+                )
+
+        for url in extract_urls(link_text):
             ref = await self._ref_from_url(url)
             if ref is None:
                 continue

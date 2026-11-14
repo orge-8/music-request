@@ -153,6 +153,9 @@ _CARD_TEXT_RE = re.compile(r"\[(QQ音乐|网易云音乐|音乐分享)\]\s*(.+)\
 # [小程序] QQ音乐：歌名 - 歌手
 _MINAPP_CARD_RE = re.compile(r"\[小程序\]\s*(QQ音乐|网易云音乐)\s*[：:]\s*(.+)\s+-\s+(.+)$")
 
+# 卡片只有歌名、没有歌手：[QQ音乐] 歌名 / [音乐分享] 歌名
+_CARD_ONLY_RE = re.compile(r"\[(QQ音乐|网易云音乐|音乐分享)\]\s*([^\s-][^[]*)$")
+
 # 分享xxx的单曲《歌名》: URL (来自@网易云音乐)
 _NETEASE_SHARE_RE = re.compile(r"分享.+?的单曲《(.+?)》\s*[：:]\s*(https?://[^\s()]+)")
 
@@ -164,6 +167,87 @@ _PLATFORM_BY_TAG: dict[str, str] = {
     "网易云音乐": PLATFORM_NETEASE,
 }
 
+#: 卡片正文里「卡片跳转链接」的尾巴：`… 链接: https://…`。
+#: 出处：MaiBot 统一 QQ 连接器（MaiBot-SnowLuma-Adapter）
+#: `codecs/inbound/cards.py` 的 `f"链接: {jump_url}"`（音乐卡片）与
+#: `_build_preview_text_segments` 的 `f"{main_text} 链接: {jump_url}"`（通用卡片）。
+_CARD_LINK_TAIL_RE = re.compile(r"\s*链接\s*[:：]\s*(\S+)\s*$")
+
+#: 适配器渲染卡片正文时用的标签前缀（`[QQ音乐] …` / `[小程序] …` / `[json:…]` 等）。
+#: 命中即视为「这段文本是卡片渲染出来的」，不是用户手打的正文。
+_CARD_TAG_RE = re.compile(
+    r"\[(?:QQ音乐|网易云音乐|音乐分享|小程序|json[^\]]*|xml|share"
+    r"|图文分享|QQ空间|群相册|QQ收藏)\]"
+)
+
+#: CQ 码片段（`[CQ:music,type=custom,url=…]`）：里面的 `url=` 同样是卡片载荷
+_CQ_CODE_RE = re.compile(r"\[CQ:[^\]]*\]")
+
+
+def _strip_trailing_punctuation(url: str) -> str:
+    """剥掉 URL 尾部粘连的中英文标点。"""
+    while url and url[-1] in _TRAILING_PUNCTUATION:
+        url = url[:-1]
+    return url
+
+
+def _split_card_link_tail(text: str) -> tuple[str, str]:
+    """把卡片正文尾部的 `链接: URL` 切出来。
+
+    Args:
+        text: 适配器渲染出的卡片文本。
+
+    Returns:
+        (去掉链接尾巴的正文, 链接)。没有链接尾巴时第二项为 ``""``。
+    """
+    match = _CARD_LINK_TAIL_RE.search(text)
+    if not match:
+        return text.strip(), ""
+    return text[: match.start()].strip(), _strip_trailing_punctuation(match.group(1).strip())
+
+
+def has_card_markup(text: str) -> bool:
+    """文本是否带适配器渲染卡片的痕迹（卡片标签或 CQ 码）。
+
+    Args:
+        text: 消息纯文本。
+
+    Returns:
+        命中卡片标签 / CQ 码返回 True。
+    """
+    if not text:
+        return False
+    return bool(_CARD_TAG_RE.search(text) or _CQ_CODE_RE.search(text))
+
+
+def strip_card_injected_text(text: str) -> str:
+    """剥掉卡片渲染内容，只留用户手打的正文（供「纯链接解析」使用）。
+
+    为什么必须剥：适配器会把卡片的 jumpUrl 拼回正文，
+    `processed_plain_text` 于是形如
+    `[QQ音乐] 小城夏天 - LBI利比 链接: https://i.y.qq.com/v8/playsong.html?songmid=xxx`。
+    若对整段直接跑 `extract_urls`，卡片里的链接会被当成用户输入解析，
+    于是**关掉 `auto_parse_card` 也照样把卡片解出来**（真机 2026-11-04 报障）。
+
+    规则（保守取向：宁可漏解析，不可越过开关）：
+        1. 先删掉全部 CQ 码片段——`url=` 参数属于卡片载荷；
+        2. 命中卡片标签时，**从标签处到结尾整段丢弃**——卡片渲染是连续的一段，
+           标签之后的文字（标题/歌手/链接）全部来自卡片。
+
+    Args:
+        text: 消息纯文本（`processed_plain_text` / `raw_message`）。
+
+    Returns:
+        只含用户正文的文本；纯卡片消息返回空串。
+    """
+    if not text:
+        return ""
+    cleaned = _CQ_CODE_RE.sub(" ", text)
+    match = _CARD_TAG_RE.search(cleaned)
+    if match:
+        cleaned = cleaned[: match.start()]
+    return cleaned.strip()
+
 
 def parse_music_card_text(text: str) -> MusicCardInfo | None:
     """从适配器转换后的纯文本中识别音乐分享卡片。
@@ -172,9 +256,15 @@ def parse_music_card_text(text: str) -> MusicCardInfo | None:
         - 卡片：[QQ音乐] 歌名 - 歌手
         - 卡片：[网易云音乐] 歌名 - 歌手
         - 卡片：[音乐分享] 歌名 - 歌手（平台未知，用默认平台搜索）
+        - 卡片（带链接尾巴）：[QQ音乐] 歌名 - 歌手 链接: <jumpUrl>
         - 小程序：[小程序] QQ音乐：歌名 - 歌手
         - 网易云分享文本：分享xxx的单曲《歌名》: URL (来自@网易云音乐)
         - QQ音乐分享文本：分享歌曲 《歌名》URL @QQ音乐
+
+    统一 QQ 连接器（NapCat / SnowLuma 两类画像都走同一套 inbound codec）
+    会把卡片 jumpUrl 以 `链接: xxx` 拼在正文尾部，这里把尾巴切出来写进
+    `MusicCardInfo.url`：既避免歌手名被链接污染（会拖垮按歌名搜索的召回），
+    也让调用方能直接拿精确链接解析，不必依赖 `/get_msg` 回溯。
 
     Args:
         text: 消息纯文本。
@@ -188,22 +278,40 @@ def parse_music_card_text(text: str) -> MusicCardInfo | None:
     if not stripped:
         return None
 
-    match = _CARD_TEXT_RE.match(stripped)
+    # 卡片正文 + 尾部链接分开看：尾巴不参与歌名/歌手匹配
+    body, tail_url = _split_card_link_tail(stripped)
+    if not body:
+        body, tail_url = stripped, ""
+
+    match = _CARD_TEXT_RE.match(body)
     if match:
         tag, song_name, artist = match.group(1), match.group(2).strip(), match.group(3).strip()
         return MusicCardInfo(
             platform=_PLATFORM_BY_TAG.get(tag, ""),
             song_name=song_name,
             artist=artist,
+            url=tail_url,
         )
 
-    match = _MINAPP_CARD_RE.match(stripped)
+    # 卡片只有歌名没有歌手（`[音乐分享] 歌名` / `[QQ音乐] 歌名`）：仍算卡片，
+    # 但歌手留空——不能把后面的链接当成歌手名
+    match = _CARD_ONLY_RE.match(body)
+    if match:
+        tag, song_name = match.group(1), match.group(2).strip()
+        return MusicCardInfo(
+            platform=_PLATFORM_BY_TAG.get(tag, ""),
+            song_name=song_name,
+            url=tail_url,
+        )
+
+    match = _MINAPP_CARD_RE.match(body)
     if match:
         tag, song_name, artist = match.group(1), match.group(2).strip(), match.group(3).strip()
         return MusicCardInfo(
             platform=_PLATFORM_BY_TAG.get(tag, ""),
             song_name=song_name,
             artist=artist,
+            url=tail_url,
         )
 
     match = _NETEASE_SHARE_RE.search(stripped)

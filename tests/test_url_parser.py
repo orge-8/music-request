@@ -11,9 +11,11 @@ import pytest
 from url_parser import (
     MusicCardInfo,
     extract_urls,
+    has_card_markup,
     is_allowed_music_url,
     parse_music_card_text,
     parse_music_url,
+    strip_card_injected_text,
 )
 
 
@@ -148,6 +150,96 @@ def test_card_text_qq_share() -> None:
 )
 def test_card_text_non_music_returns_none(text: str) -> None:
     assert parse_music_card_text(text) is None
+
+
+# ---------- 适配器卡片正文：链接尾巴与作用域切分 ----------
+
+
+def test_card_text_link_tail_is_split_from_artist() -> None:
+    """统一 QQ 连接器把 jumpUrl 以「链接: 」拼在正文尾部。
+
+    旧实现会把整条链接吃进歌手名（`LBI利比 链接: https://…`），
+    既污染按歌名搜索的召回，又拿不到精确歌曲 ID。
+    """
+    card = parse_music_card_text(
+        "[QQ音乐] 小城夏天 - LBI利比 链接: https://i.y.qq.com/v8/playsong.html?songmid=003QWE"
+    )
+    assert card is not None
+    assert card.song_name == "小城夏天"
+    assert card.artist == "LBI利比", f"歌手名被链接污染: {card.artist!r}"
+    assert card.query == "小城夏天 LBI利比"
+    assert card.url == "https://i.y.qq.com/v8/playsong.html?songmid=003QWE"
+
+
+def test_card_text_link_tail_trailing_punctuation_stripped() -> None:
+    """链接尾巴后跟中文标点时要剥掉，否则解析不出歌曲 ID。"""
+    card = parse_music_card_text("[网易云音乐] 晴天 - 周杰伦 链接: https://music.163.com/song?id=186016。")
+    assert card is not None
+    assert card.url == "https://music.163.com/song?id=186016"
+
+
+def test_card_text_song_name_only() -> None:
+    """卡片只有歌名（没有「 - 歌手」）也要认得，不能把链接当成歌手。"""
+    card = parse_music_card_text("[音乐分享] 某首歌 链接: https://music.163.com/song?id=9")
+    assert card is not None
+    assert card.song_name == "某首歌"
+    assert card.artist == ""
+    assert card.url == "https://music.163.com/song?id=9"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # 纯卡片文本：整段都是适配器渲染的，没有用户正文
+        "[QQ音乐] 小城夏天 - LBI利比 链接: https://i.y.qq.com/v8/playsong.html?songmid=1",
+        "[音乐分享] 某首歌",
+        "[小程序] QQ音乐：小城夏天 - LBI利比",
+        "[CQ:music,type=custom,url=https://i.y.qq.com/v8/playsong.html?songmid=1,title=x]",
+        "",
+    ],
+)
+def test_strip_card_injected_text_removes_card_payload(text: str) -> None:
+    assert strip_card_injected_text(text) == ""
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "这首歌好听 https://music.163.com/song?id=12345",
+        # 用户自己写「链接: 」不是卡片痕迹，不能顺手删掉
+        "链接: https://music.163.com/song?id=12345",
+        "点歌 晴天",
+    ],
+)
+def test_strip_card_injected_text_keeps_user_text(text: str) -> None:
+    assert strip_card_injected_text(text) == text.strip()
+
+
+def test_strip_card_injected_text_keeps_prefix_before_card() -> None:
+    """用户正文在卡片之前：保留正文，卡片起点之后整段丢弃。"""
+    prefix = "看看这个 https://music.163.com/song?id=1 "
+    stripped = strip_card_injected_text(
+        prefix + "[QQ音乐] 小城夏天 - LBI利比 链接: https://i.y.qq.com/v8/playsong.html?songmid=1"
+    )
+    assert stripped == prefix.strip()
+    assert parse_music_url(stripped) is not None
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("[QQ音乐] 小城夏天 - LBI利比", True),
+        ("[小程序] QQ音乐：小城夏天", True),
+        ("[json:音乐]", True),
+        ("[xml]", True),
+        ("[CQ:music,type=163,id=1]", True),
+        ("https://music.163.com/song?id=1", False),
+        ("点歌 晴天", False),
+        ("", False),
+    ],
+)
+def test_has_card_markup(text: str, expected: bool) -> None:
+    assert has_card_markup(text) is expected
 
 
 @pytest.mark.parametrize(
