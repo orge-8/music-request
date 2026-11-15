@@ -89,6 +89,10 @@
 - **删除插件内过时的 `check_plugin.py` 副本**（规则基线还停在 Host 1.2.3 /
   SDK 2.8.0）：门禁改走 devkit 统一检查器（基线 1.4.3），静态检查
   PASS 45 → **PASS 47 / WARN 0**，消除「旧副本基线」WARN。
+- **新增 `.gitattributes`**：`tests/contracts/*.json text eol=lf`，强制契约镜像
+  以 LF 落盘——Windows `core.autocrlf=true` 会在 checkout 时把镜像转成 CRLF，
+  与 devkit LF 事实源产生 54 字节假漂移、令 gate contracts 守卫 FAIL；
+  入库 blob 本就是 LF，此规则杜绝工作树再次被转码。
 
 ### 验证
 
@@ -111,4 +115,13 @@
   - 据此放宽 `_manifest.json`：host max 1.3.99→**1.4.4**、
     sdk max 2.16.99→**2.23.0**（实测后才 bump，未写占位大数）。
   - WebUI 变更后复跑官方 v1.4.4 loader 探针：加载成功，10 组件 / 5 能力。
+- **官方最新复验（2026-11-15，发布准入依据）**：官方渠道核对 MaiBot 已升至
+  **v1.4.5**（2026-11-14 发布）、SDK 仍 **2.23.0**。
+  - 官方 v1.4.5 源码 PluginLoader 加载探针：加载成功，**10 组件 / 5 能力**；
+    host max 放宽到 1.4.5 后严格区间 host 1.0.0~1.4.5 / sdk 2.5.0~2.23.0
+    **无兼容警告**通过（bump 前为兼容模式加载并告警）。
+  - SDK 2.23.0 隔离 venv（含 cryptography 50.0.2）全量 pytest：
+    **577 passed / 0 skipped**。
+  - 据此放宽 `_manifest.json`：host max 1.4.4→**1.4.5**（实测后才 bump，
+    未写占位大数）；sdk max 维持 2.23.0。
 - **未真机验证**：超时收紧与自检命令需真机回归（部署指南随交付给出）。
