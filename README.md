@@ -538,6 +538,32 @@ v1.7.2 给槽位获取加了等待上限（预算的 30%，夹在 3–15 秒之�
 调用名固定为 `org.mai-mai.cv-lyric-context.get_song_bilibili`；对方插件 ID 若变更，
 表现为静默回退到平台搜索（不报错），日志里有 `VCPedia 曲库查询不可用` 一行。
 
+### 联动加固（v1.8.0）
+
+跨插件契约有了**单一事实源**：devkit 的 `tools/maibot-devkit/contracts/cv_music_v1.json`
+（两侧仓库 `tests/contracts/` 各有镜像，门禁校验逐字节一致）。本插件是
+`get_song_bilibili` 的**消费方**，加固内容：
+
+- **3 秒硬超时**：跨插件调用包在 `asyncio.wait_for(..., 3.0)` 里（提供方 `@API`
+  也声明了 `timeout_ms=3000`，双闸）。此前未声明超时，宿主默认等 60s，
+  一次慢查询能拖满整条点歌工具链。超时后静默回退平台搜索，绝不拖死点歌。
+- **失败七分类 + 内存计数**：`hit` / `not_found_or_no_bvid` / `timeout` /
+  `not_installed` / `no_api_proxy`（老 Host）/ `schema_mismatch`（返回形状
+  不符契约，含缺 `found` 键的占位结构）/ `error`。计数存内存、重启清零。
+- **`/点歌联动自检` 命令**：三段输出——① `api.list` 可见性（含对方声明的
+  `timeout_ms`）；② 真实探针（走与点歌完全相同的查询链路，不计入运行计数）；
+  ③ 七类运行计数。联动不放歌时先跑这个，比翻日志快。
+- **契约化测试**：所有跨插件假数据由契约 JSON 生成并全量校验键集/类型/枚举，
+  杜绝「测试假数据缺键仍全绿」；另有双插件同进程的真实对端端到端测试。
+
+| 自检输出 | 含义与处置 |
+|---|---|
+| `API 可见性: ❌ 不可见` | cv_lyric_context 未安装/未启用，或版本过旧没有该 API |
+| `timeout_ms=未声明→宿主默认60s` | 对方还是旧版（v2.19.0 前），建议升级 |
+| `探测: timeout` | 提供方负载过高或 Host RPC 异常；偶发可忽略（自动回退），持续出现查对方日志 |
+| `探测: schema_mismatch` | 两侧版本不匹配（契约形状对不上），把两侧都升到最新 |
+| `运行计数` 里 `not_found_or_no_bvid` 占绝大多数 | 正常——多数点歌请求本就不在 V家曲库 |
+
 ## 安全与隐私
 
 插件手握三套凭据（网易云 `MUSIC_U`、QQ `uin + qqmusic_key`、B站 `SESSDATA`），
@@ -580,6 +606,8 @@ manifest `capabilities`：
 | `send.text` | 结果回显、状态、错误提示 |
 | `send.custom` | 发送 `music` / `voiceurl` 自定义消息段 |
 | `chat.get_all_streams` | Tool 场景下按 `stream_id` 反查群号，供 NapCat 直连发送 |
+| `api.call` | 跨插件调用 cv_lyric_context 的 `get_song_bilibili`（原曲优先，v1.6.4） |
+| `api.list` | 联动自检的 API 可见性探测（v1.8.0） |
 
 Python 依赖：`httpx >= 0.27`、`cryptography >= 42`（网易云 eapi 加密通道）。
 未装 `cryptography` 时插件不会崩：会自动跳过 eapi，退到标准 Web 接口与直链重定向
@@ -601,7 +629,7 @@ Python 依赖：`httpx >= 0.27`、`cryptography >= 42`（网易云 eapi 加密�
 | B站取流报"取 cid 失败（2 条通路均不可用）" | pagelist 与 wbi/view 同时被拒。看同条日志的两段原因：`SESSDATA 已失效` 就更新 cookie，`匿名态` 就配置 sessdata，都是 412 就等冷却（插件已自动刷新过 buvid 并重试一次） |
 | B站取流报"响应异常: HTTP 404" / `code=-404` | 该 BV 视频已被删除或设为私享 → 搜索结果已过期，重新搜一次 |
 | 日志出现"B站音频直链不在 CDN 白名单" | 该条是 PCDN 地址被拒（正常现象）。插件会自动改用同一条流的 `backupUrl` 官方备份（v1.6.3）；若最终报"未返回可用音频轨"，看日志里列出的 host——全是 PCDN 域名说明备份也没给官方地址，此时才需要扩白名单 |
-| 日志有 `VCPedia 曲库查询不可用` | 跨插件调用失败：对方未安装/未启用，或 Host 版本过低没有 `ctx.api`。插件会自动回退 B站搜索，功能不受影响；想用原曲优先就装上 cv_lyric_context |
+| 日志有 `VCPedia 曲库查询不可用` | 跨插件调用失败：对方未安装/未启用、超时、返回形状不符契约，或 Host 版本过低没有 `ctx.api`。日志括号里带分类（v1.8.0），插件会自动回退平台搜索，功能不受影响；跑 `/点歌联动自检` 看可见性与计数，想用原曲优先就装上 cv_lyric_context |
 | 日志有 `VCPedia 命中「XX」但尚未采集 B站标识` | 曲库里有这首歌，但 v2.14.0 之后没重抓过它。走搜索即可；要补数据在对方插件跑 `/歌词 补歌词` |
 | B站「找到…但音乐平台未返回可用音频」 | 该视频是付费/充电视频或 dash 缺音频轨（提示里会带出具体原因）→ 换一个投稿 |
 | B站文件发不出，提示"暂时发不了音频文件" | NapCat HTTP API 未配置/不可达，或缓存目录映射失败（跑 `/点歌自检`）；B站刻意不降级卡片 |
@@ -663,15 +691,16 @@ python check_plugin.py --plugin .
 # FakeHost 冒烟（不启 MaiBot，用离线替身挡网络）
 python tests/smoke_test.py
 
-# 单元测试（539 项：链接/卡片解析、卡片与链接的解析作用域隔离（v1.7.7）、
+# 单元测试（568 项：链接/卡片解析、卡片与链接的解析作用域隔离（v1.7.7）、
 #          相关度排序与过滤、组件绑定、命令正则、配置模型、CQ 转义、eapi 加密、
 #          路径映射与探针、形态兜底与否定语境、
 #          本地歌曲库（扫描/搜索/映射/命令/工具）、
 #          B站平台（WBI 签名向量/时长过滤/播放量预排/CDN 白名单/强制文件形态/文本降级）、
+#          VCPedia 联动（契约形状/版本协商/超时/七分类计数/自检命令/真实对端 E2E，v1.8.0）、
 #          凭据不外发 / 短链白名单 / 逐跳重定向校验等安全回归）
 python -m pytest -q tests
 
-# 交付门禁（三层串跑）
+# 交付门禁（四层串跑：静态检查 → 契约一致性 → 冒烟 → pytest）
 python run_gates.py --plugin .
 ```
 

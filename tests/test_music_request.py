@@ -82,12 +82,12 @@ def test_manifest_declares_cryptography_dependency(manifest: dict) -> None:
 # ---------- 组件绑定（装饰器绑错方法的唯一本地防线） ----------
 
 
-def test_get_components_exposes_all_nine() -> None:
+def test_get_components_exposes_all_ten() -> None:
     """覆盖 Runner 注册链路：漏调 super().__init__() 时这里会 AttributeError。"""
     components = MusicRequestPlugin().get_components()
     names = {item["name"] for item in components}
     assert names == {
-        "点歌", "选歌", "点歌状态", "点歌自检", "本地歌", "本地库",
+        "点歌", "选歌", "点歌状态", "点歌自检", "点歌联动自检", "本地歌", "本地库",
         "search_and_play_music", "play_local_music", "parse_music_link",
     }, names
 
@@ -99,6 +99,7 @@ def test_get_components_exposes_all_nine() -> None:
         ("cmd_选歌", "选歌"),
         ("cmd_点歌状态", "点歌状态"),
         ("cmd_点歌自检", "点歌自检"),
+        ("cmd_点歌联动自检", "点歌联动自检"),
         ("search_and_play_music", "search_and_play_music"),
         ("parse_music_link", "parse_music_link"),
     ],
@@ -281,7 +282,9 @@ def test_tool_description_covers_lyric_chat_trigger() -> None:
     规划器仍可能不选它——描述是规划器做工具选择的唯一依据。
     """
     info = MusicRequestPlugin.search_and_play_music.__maibot_component_info__
-    text = f"{info.description}\n{info.detailed_description}"
+    # SDK 2.22+ 把 detailed_description 归一化并进 description（旧字段被移除），
+    # 老 SDK 仍保留独立字段——两种形态都要能读到完整描述。
+    text = f"{info.description}\n{getattr(info, 'detailed_description', '') or ''}"
     for keyword in ("歌词", "想听", "可点播查询"):
         assert keyword in text, f"工具描述缺少联动关键词「{keyword}」: {text}"
 

@@ -26,7 +26,30 @@ from plugin import MusicRequestPlugin
 from music_api import SongInfo
 from url_parser import PLATFORM_BILI
 
+# v1.8.0 联动加固：假数据一律按契约单一事实源构造完整形状，
+# 杜绝手写字典缺键导致的「契约漂移测试照样绿」。
+from contract_cv_music import sample_result, validate_result  # noqa: E402
+
 _BILI_API = "org.mai-mai.cv-lyric-context.get_song_bilibili"
+
+
+def _hit(**overrides) -> dict:
+    """契约完整形状的命中样例（默认 exact 命中普通DISCO）。"""
+    base = sample_result(
+        "get_song_bilibili",
+        found=True, name="普通DISCO", aid=2129461, bvid="", match="exact",
+    )
+    base.update(overrides)
+    validate_result("get_song_bilibili", base)
+    return base
+
+
+def _miss(**overrides) -> dict:
+    """契约完整形状的未命中样例。"""
+    base = sample_result("get_song_bilibili", found=False, reason="曲库里没有这首歌")
+    base.update(overrides)
+    validate_result("get_song_bilibili", base)
+    return base
 
 
 class _FakeApi:
@@ -71,10 +94,7 @@ def _prepare(*, vcpedia_lookup: bool = True):
 def test_hit_with_aid_skips_search() -> None:
     """av 号命中：直接构造 iv 前缀的 song_id，且**完全不调用搜索**。"""
     plug, ctx, searches = _prepare()
-    ctx.api = _FakeApi(
-        {"schema_version": 1, "reason": "", "found": True, "name": "普通DISCO",
-         "aid": 2129461, "bvid": ""}
-    )
+    ctx.api = _FakeApi(_hit())
     songs = asyncio.run(plug._search_ranked("普通DISCO", PLATFORM_BILI))
     assert searches == [], "命中曲库时不应再走搜索（省一次风控暴露）"
     assert len(songs) == 1
@@ -86,9 +106,7 @@ def test_hit_with_aid_skips_search() -> None:
 def test_hit_with_bvid_prefers_bvid() -> None:
     """bvid 与 aid 同时存在时用 bvid（更稳定，不怕 av 号未来退役）。"""
     plug, ctx, searches = _prepare()
-    ctx.api = _FakeApi(
-        {"found": True, "name": "世末歌者", "aid": 13787072, "bvid": "BV1Qs411k7Qv"}
-    )
+    ctx.api = _FakeApi(_hit(name="世末歌者", aid=13787072, bvid="BV1Qs411k7Qv"))
     songs = asyncio.run(plug._search_ranked("世末歌者", PLATFORM_BILI))
     assert searches == []
     assert songs[0].song_id == "BV1Qs411k7Qv"
@@ -97,7 +115,7 @@ def test_hit_with_bvid_prefers_bvid() -> None:
 def test_api_called_with_expected_name() -> None:
     """调用名必须是 `<plugin_id>.<api_name>`，参数用 name=。"""
     plug, ctx, _ = _prepare()
-    api = _FakeApi({"found": True, "name": "大氿歌", "aid": 45020985, "bvid": ""})
+    api = _FakeApi(_hit(name="大氿歌", aid=45020985))
     ctx.api = api
     asyncio.run(plug._search_ranked("大氿歌", PLATFORM_BILI))
     assert api.calls == [(_BILI_API, {"name": "大氿歌"})]
@@ -108,7 +126,7 @@ def test_api_called_with_expected_name() -> None:
 
 def test_not_found_falls_back_to_search() -> None:
     plug, ctx, searches = _prepare()
-    ctx.api = _FakeApi({"found": False, "reason": "曲库里没有这首歌", "name": "", "aid": None, "bvid": ""})
+    ctx.api = _FakeApi(_miss())
     asyncio.run(plug._search_ranked("不存在的歌", PLATFORM_BILI))
     assert searches == ["不存在的歌"]
 
@@ -116,10 +134,7 @@ def test_not_found_falls_back_to_search() -> None:
 def test_found_without_id_falls_back() -> None:
     """曲库有歌但 B站标识还没采集：必须回退搜索，不能当作失败。"""
     plug, ctx, searches = _prepare()
-    ctx.api = _FakeApi(
-        {"found": True, "reason": "该曲目尚未采集 B站标识", "name": "旧歌",
-         "aid": None, "bvid": ""}
-    )
+    ctx.api = _FakeApi(_hit(name="旧歌", aid=None, reason="该曲目尚未采集 B站标识"))
     asyncio.run(plug._search_ranked("旧歌", PLATFORM_BILI))
     assert searches == ["旧歌"]
 
@@ -150,12 +165,36 @@ def test_garbage_result_falls_back() -> None:
     assert searches == ["普通DISCO"]
 
 
+def test_slow_api_times_out_and_falls_back() -> None:
+    """跨插件调用超过契约 3s 预算 → wait_for 兜底超时，静默回退搜索。
+
+    老 Host 不认 @API 的 timeout_ms 声明时会落到默认 60s RPC 预算，
+    消费方的 asyncio.wait_for 是最后一道闸——不能让用户点首歌等一分钟。
+    """
+    import time as _time
+
+    plug, ctx, searches = _prepare()
+
+    class _SlowApi:
+        async def call(self, api_name: str, **kwargs):
+            await asyncio.sleep(10)  # 远超 3s 预算
+            return _hit()
+
+    ctx.api = _SlowApi()
+    started = _time.monotonic()
+    songs = asyncio.run(plug._search_ranked("普通DISCO", PLATFORM_BILI))
+    elapsed = _time.monotonic() - started
+    assert songs == []
+    assert searches == ["普通DISCO"]
+    assert 2.5 <= elapsed < 6.0, f"应在 3s 左右超时回退，实际 {elapsed:.1f}s"
+
+
 # ---------- 开关与作用域 ----------
 
 
 def test_disabled_by_config_never_calls_api() -> None:
     plug, ctx, searches = _prepare(vcpedia_lookup=False)
-    api = _FakeApi({"found": True, "name": "普通DISCO", "aid": 2129461, "bvid": ""})
+    api = _FakeApi(_hit())
     ctx.api = api
     asyncio.run(plug._search_ranked("普通DISCO", PLATFORM_BILI))
     assert api.calls == [], "关闭开关后不应发出任何跨插件调用"
@@ -165,7 +204,7 @@ def test_disabled_by_config_never_calls_api() -> None:
 def test_other_platforms_unaffected() -> None:
     """VCPedia 只对 B站生效：网易云/QQ音乐路径一次都不该查。"""
     plug, ctx, searches = _prepare()
-    api = _FakeApi({"found": True, "name": "普通DISCO", "aid": 2129461, "bvid": ""})
+    api = _FakeApi(_hit())
     ctx.api = api
     asyncio.run(plug._search_ranked("普通DISCO", "163"))
     assert api.calls == []
@@ -174,7 +213,7 @@ def test_other_platforms_unaffected() -> None:
 
 def test_blank_keyword_skips_lookup() -> None:
     plug, ctx, searches = _prepare()
-    api = _FakeApi({"found": True, "name": "x", "aid": 1, "bvid": ""})
+    api = _FakeApi(_hit(name="x", aid=1))
     ctx.api = api
     asyncio.run(plug._search_ranked("   ", PLATFORM_BILI))
     assert api.calls == []
@@ -203,10 +242,7 @@ def _install_fake_send(plug, *, ok: bool = True):
 
 
 def _exact_hit() -> dict:
-    return {
-        "schema_version": 1, "reason": "", "found": True, "name": "普通DISCO",
-        "aid": 2129461, "bvid": "", "match": "exact",
-    }
+    return _hit()
 
 
 def test_tool_prefers_vcpedia_over_platform_search() -> None:
@@ -234,7 +270,7 @@ def test_tool_falls_back_to_platforms_when_send_fails() -> None:
 def test_tool_ignores_prefix_match() -> None:
     """「普通DISCO 三无」想听三无的翻唱版，不能靠剥 token 命中原曲。"""
     plug, ctx, searches = _prepare()
-    hit = {**_exact_hit(), "match": "prefix"}
+    hit = _hit(match="prefix")
     ctx.api = _FakeApi(hit)
     sent = _install_fake_send(plug)
     asyncio.run(plug.search_and_play_music(query="普通DISCO 三无", stream_id="s1"))
@@ -294,7 +330,7 @@ def test_command_respects_explicit_platform(platform: str) -> None:
 def test_explicit_bili_restricts_platforms() -> None:
     """用户点名 B站时，只在 B站找，不跨平台。"""
     plug, ctx, searches = _prepare()
-    ctx.api = _FakeApi({"found": False, "reason": "", "name": "", "aid": None, "bvid": "", "match": ""})
+    ctx.api = _FakeApi(_miss(reason=""))
     _install_fake_send(plug, ok=False)
     asyncio.run(
         plug.search_and_play_music(query="世末积雨云", platform="bili", stream_id="s1")
@@ -318,7 +354,7 @@ def test_explicit_163_skips_vcpedia() -> None:
 @pytest.mark.parametrize("alias", ["bili", "B站", "哔哩哔哩", "bilibili"])
 def test_platform_alias_recognized(alias: str) -> None:
     plug, ctx, searches = _prepare()
-    ctx.api = _FakeApi({"found": False, "reason": "", "name": "", "aid": None, "bvid": "", "match": ""})
+    ctx.api = _FakeApi(_miss(reason=""))
     _install_fake_send(plug, ok=False)
     asyncio.run(plug.search_and_play_music(query="某歌", platform=alias, stream_id="s1"))
     assert searches == ["某歌"]
@@ -327,7 +363,7 @@ def test_platform_alias_recognized(alias: str) -> None:
 def test_unknown_platform_string_falls_back_to_chain() -> None:
     """无法识别的平台写法不能假装「用户指定了平台」（不能被兜底成 163）。"""
     plug, ctx, searches = _prepare()
-    ctx.api = _FakeApi({"found": False, "reason": "", "name": "", "aid": None, "bvid": "", "match": ""})
+    ctx.api = _FakeApi(_miss(reason=""))
     _install_fake_send(plug, ok=False)
     asyncio.run(plug.search_and_play_music(query="某歌", platform="kugou", stream_id="s1"))
     assert len(searches) == 3, f"应走完整平台链: {searches}"
@@ -348,11 +384,7 @@ def test_explicit_bili_when_disabled_reports_clearly() -> None:
 
 
 def _prefix_hit(singers: list[str]) -> dict:
-    return {
-        "schema_version": 1, "reason": "", "found": True,
-        "name": "世末积雨云", "aid": 1579079, "bvid": "",
-        "match": "prefix", "singers": singers,
-    }
+    return _hit(name="世末积雨云", aid=1579079, match="prefix", singers=singers)
 
 
 def test_prefix_with_original_singer_is_accepted() -> None:
@@ -370,7 +402,9 @@ def test_prefix_with_original_singer_is_accepted() -> None:
 def test_prefix_with_cover_singer_is_rejected() -> None:
     """「普通DISCO 三无」——三无不是原曲歌手，用户点名的是翻唱版。"""
     plug, ctx, searches = _prepare()
-    hit = {**_prefix_hit(["洛天依", "言和"]), "name": "普通DISCO", "aid": 2129461}
+    hit = _prefix_hit(["洛天依", "言和"])
+    hit.update(name="普通DISCO", aid=2129461)
+    validate_result("get_song_bilibili", hit)
     ctx.api = _FakeApi(hit)
     sent = _install_fake_send(plug)
     asyncio.run(
@@ -382,7 +416,12 @@ def test_prefix_with_cover_singer_is_rejected() -> None:
 
 
 def test_prefix_without_singers_in_api_response_is_rejected() -> None:
-    """上游没给 singers（旧版 cv_lyric_context）时保持保守：回退搜索。"""
+    """上游没给 singers（旧版 cv_lyric_context）时保持保守：回退搜索。
+
+    这里**故意手写缺 singers 的畸形字典**（不走契约 sample_result）：
+    契约 v1 起 singers 是必备键，本用例专门验证「老版上游少给键」的兼容性，
+    属于契约外的降级输入，不能被 sample_result 补齐，否则就测不到了。
+    """
     plug, ctx, searches = _prepare()
     hit = {"schema_version": 1, "reason": "", "found": True, "name": "普通DISCO",
            "aid": 2129461, "bvid": "", "match": "prefix"}
@@ -405,11 +444,10 @@ def test_prefix_without_singers_in_api_response_is_rejected() -> None:
 
 
 def _prefix_bv() -> dict:
-    return {
-        "schema_version": 1, "reason": "", "found": True, "name": "世末歌者",
-        "aid": None, "bvid": "BV1Qs411k7Qv", "match": "prefix",
-        "singers": ["乐正绫"],
-    }
+    return _hit(
+        name="世末歌者", aid=None, bvid="BV1Qs411k7Qv", match="prefix",
+        singers=["乐正绫"],
+    )
 
 
 def test_prefix_noise_singer_not_in_user_text_is_accepted() -> None:
@@ -429,10 +467,7 @@ def test_prefix_noise_singer_not_in_user_text_is_accepted() -> None:
 def test_prefix_rejected_when_user_really_named_cover_singer() -> None:
     """用户原话里确实说了非原曲歌手 → 尊重，回退搜索。"""
     plug, ctx, searches = _prepare()
-    hit = {
-        "schema_version": 1, "reason": "", "found": True, "name": "普通DISCO",
-        "aid": 2129461, "bvid": "", "match": "prefix", "singers": ["洛天依", "言和"],
-    }
+    hit = _hit(name="普通DISCO", aid=2129461, match="prefix", singers=["洛天依", "言和"])
     ctx.api = _FakeApi(hit)
     sent = _install_fake_send(plug)
     asyncio.run(
@@ -447,10 +482,7 @@ def test_prefix_rejected_when_user_really_named_cover_singer() -> None:
 def test_prefix_noise_rejected_when_trigger_text_missing() -> None:
     """拿不到用户原话时保持保守：无法判断就回退搜索，不赌。"""
     plug, ctx, searches = _prepare()
-    hit = {
-        "schema_version": 1, "reason": "", "found": True, "name": "普通DISCO",
-        "aid": 2129461, "bvid": "", "match": "prefix", "singers": ["洛天依", "言和"],
-    }
+    hit = _hit(name="普通DISCO", aid=2129461, match="prefix", singers=["洛天依", "言和"])
     ctx.api = _FakeApi(hit)
     sent = _install_fake_send(plug)
     asyncio.run(plug.search_and_play_music(query="普通DISCO 三无", stream_id="s1"))
@@ -467,8 +499,7 @@ def test_failure_detail_lists_every_platform(caplog) -> None:
     import logging
 
     plug, ctx, searches = _prepare()
-    ctx.api = _FakeApi({"found": False, "reason": "", "name": "", "aid": None,
-                        "bvid": "", "match": ""})
+    ctx.api = _FakeApi(_miss(reason=""))
     _install_fake_send(plug, ok=False)
     with caplog.at_level(logging.WARNING, logger="plugin"):
         out = asyncio.run(plug.search_and_play_music(query="某歌", stream_id="s1"))
@@ -490,10 +521,9 @@ def test_failure_detail_lists_every_platform(caplog) -> None:
 
 
 def _shimo_gaobai() -> dict:
-    return {
-        "schema_version": 1, "reason": "", "found": True, "name": "世末告白",
-        "aid": None, "bvid": "BV1qonXz2EtU", "match": "exact", "singers": ["洛天依"],
-    }
+    return _hit(
+        name="世末告白", aid=None, bvid="BV1qonXz2EtU", singers=["洛天依"],
+    )
 
 
 def test_hallucinated_platform_is_ignored() -> None:
@@ -522,8 +552,7 @@ def test_hallucinated_platform_is_ignored() -> None:
 def test_platform_respected_when_user_mentioned_it(text: str, platform: str) -> None:
     """用户原话确实提到平台时，参数生效（不查曲库、只走该平台）。"""
     plug, ctx, searches = _prepare()
-    api = _FakeApi({"found": False, "reason": "", "name": "", "aid": None,
-                    "bvid": "", "match": ""})
+    api = _FakeApi(_miss(reason=""))
     ctx.api = api
     _install_fake_send(plug, ok=False)
     asyncio.run(
@@ -537,8 +566,7 @@ def test_platform_respected_when_user_mentioned_it(text: str, platform: str) -> 
 def test_platform_trusted_when_no_trigger_text() -> None:
     """非聊天触发（拿不到原话）时信任显式参数——那是唯一的信息来源。"""
     plug, ctx, searches = _prepare()
-    ctx.api = _FakeApi({"found": False, "reason": "", "name": "", "aid": None,
-                        "bvid": "", "match": ""})
+    ctx.api = _FakeApi(_miss(reason=""))
     _install_fake_send(plug, ok=False)
     asyncio.run(
         plug.search_and_play_music(query="世末告白", platform="qq", stream_id="s1")
@@ -549,8 +577,7 @@ def test_platform_trusted_when_no_trigger_text() -> None:
 def test_platform_ignored_when_user_mentioned_another() -> None:
     """用户说「用B站」但 LLM 传了 qq：以用户原话为准，忽略错误参数。"""
     plug, ctx, searches = _prepare()
-    ctx.api = _FakeApi({"found": False, "reason": "", "name": "", "aid": None,
-                        "bvid": "", "match": ""})
+    ctx.api = _FakeApi(_miss(reason=""))
     _install_fake_send(plug, ok=False)
     asyncio.run(
         plug.search_and_play_music(
@@ -573,10 +600,7 @@ def test_platform_ignored_when_user_mentioned_another() -> None:
 
 
 def _chunyou() -> dict:
-    return {
-        "schema_version": 1, "reason": "", "found": True, "name": "春游",
-        "aid": 26553386, "bvid": "", "match": "exact", "singers": ["洛天依"],
-    }
+    return _hit(name="春游", aid=26553386, singers=["洛天依"])
 
 
 def test_platform_guard_uses_inbound_cache() -> None:
@@ -596,8 +620,7 @@ def test_platform_guard_uses_inbound_cache() -> None:
 def test_inbound_cache_is_per_session() -> None:
     """缓存按会话隔离：别的会话的原话不能拿来校验本会话。"""
     plug, ctx, searches = _prepare()
-    ctx.api = _FakeApi({"found": False, "reason": "", "name": "", "aid": None,
-                        "bvid": "", "match": ""})
+    ctx.api = _FakeApi(_miss(reason=""))
     _install_fake_send(plug, ok=False)
     plug._inbound_text.remember("other", "用B站放世末告白")
     asyncio.run(
@@ -655,10 +678,7 @@ def _install_fake_duration(plug, seconds):
 def test_long_video_is_not_played_directly() -> None:
     """时长超过直连上限 → 不直连，回去搜平台（避免白等一次上传超时）。"""
     plug, ctx, searches = _prepare()
-    hit = {
-        "schema_version": 1, "reason": "", "found": True, "name": "铁道唱歌",
-        "aid": None, "bvid": "BV1xx411c7mD", "match": "exact", "singers": ["洛天依"],
-    }
+    hit = _hit(name="铁道唱歌", aid=None, bvid="BV1xx411c7mD", singers=["洛天依"])
     ctx.api = _FakeApi(hit)
     _install_fake_duration(plug, 500)  # 8.3 分钟
     sent = _install_fake_send(plug)
@@ -670,10 +690,7 @@ def test_long_video_is_not_played_directly() -> None:
 def test_short_video_plays_directly() -> None:
     """常规曲目（3-5 分钟）照常直连。"""
     plug, ctx, searches = _prepare()
-    hit = {
-        "schema_version": 1, "reason": "", "found": True, "name": "创作",
-        "aid": None, "bvid": "BV1dG4y1o7Ji", "match": "exact", "singers": ["洛天依"],
-    }
+    hit = _hit(name="创作", aid=None, bvid="BV1dG4y1o7Ji", singers=["洛天依"])
     ctx.api = _FakeApi(hit)
     _install_fake_duration(plug, 231)
     sent = _install_fake_send(plug)
@@ -685,81 +702,7 @@ def test_short_video_plays_directly() -> None:
 def test_unknown_duration_still_plays() -> None:
     """探测失败（None）时放行——不能因为时长接口抽风就把能播的歌挡掉。"""
     plug, ctx, searches = _prepare()
-    hit = {
-        "schema_version": 1, "reason": "", "found": True, "name": "创作",
-        "aid": None, "bvid": "BV1dG4y1o7Ji", "match": "exact", "singers": ["洛天依"],
-    }
-    ctx.api = _FakeApi(hit)
-    _install_fake_duration(plug, None)
-    sent = _install_fake_send(plug)
-    asyncio.run(plug.search_and_play_music(query="创作", stream_id="s1"))
-    assert sent, "拿不到时长时应照常直连"
-
-
-def test_budget_and_gate_constants_consistent() -> None:
-    """预算与时长闸必须自洽：预算 50s 只能覆盖约 413s，闸设 420s 刚好。"""
-    assert plugin_module._TOOL_NAPCAT_UPLOAD_BUDGET == 50
-    assert plugin_module._VCPEDIA_MAX_DIRECT_SECONDS == 420
-    # 预算必须给 Host 的 60s RPC 留出回落时间
-    assert plugin_module._TOOL_NAPCAT_UPLOAD_BUDGET < 60
-
-
-# ---------- 直连时长闸（v1.7.1）----------
-#
-# 曲库 `duration` 字段实测 100% 为空，`bilibili.max_duration_seconds` 在直连
-# 路径上完全失效。实测数据：音频 ≈38.5KB/s、上传 ≈318KB/s ⇒ 50 秒预算约覆盖
-# 413 秒；「洛天依带你铁道唱歌」系列单P 8.3 分钟（约 19MB）必然传不完。
-#
-# 决策（用户 2026-10-22 确认）：**超时长就回退平台搜索**，不硬传；
-# 预算从 45s 提到 50s（不能再高，会给 Host 的 60s RPC 预算留不出回落时间）。
-
-
-def _install_fake_duration(plug, seconds):
-    """替换 _probe_bili_duration 的返回值。"""
-
-    async def fake(_video_id):
-        return seconds
-
-    plug._probe_bili_duration = fake
-
-
-def test_long_video_is_not_played_directly() -> None:
-    """时长超过直连上限 → 不直连，回去搜平台（避免白等一次上传超时）。"""
-    plug, ctx, searches = _prepare()
-    hit = {
-        "schema_version": 1, "reason": "", "found": True, "name": "铁道唱歌",
-        "aid": None, "bvid": "BV1xx411c7mD", "match": "exact", "singers": ["洛天依"],
-    }
-    ctx.api = _FakeApi(hit)
-    _install_fake_duration(plug, 500)  # 8.3 分钟
-    sent = _install_fake_send(plug)
-    asyncio.run(plug.search_and_play_music(query="铁道唱歌", stream_id="s1"))
-    assert sent == [], "超时长的歌不该直连"
-    assert searches, "应回退平台搜索"
-
-
-def test_short_video_plays_directly() -> None:
-    """常规曲目（3-5 分钟）照常直连。"""
-    plug, ctx, searches = _prepare()
-    hit = {
-        "schema_version": 1, "reason": "", "found": True, "name": "创作",
-        "aid": None, "bvid": "BV1dG4y1o7Ji", "match": "exact", "singers": ["洛天依"],
-    }
-    ctx.api = _FakeApi(hit)
-    _install_fake_duration(plug, 231)
-    sent = _install_fake_send(plug)
-    asyncio.run(plug.search_and_play_music(query="创作", stream_id="s1"))
-    assert searches == []
-    assert sent and sent[0].song_id == "BV1dG4y1o7Ji"
-
-
-def test_unknown_duration_still_plays() -> None:
-    """探测失败（None）时放行——不能因为时长接口抽风就把能播的歌挡掉。"""
-    plug, ctx, searches = _prepare()
-    hit = {
-        "schema_version": 1, "reason": "", "found": True, "name": "创作",
-        "aid": None, "bvid": "BV1dG4y1o7Ji", "match": "exact", "singers": ["洛天依"],
-    }
+    hit = _hit(name="创作", aid=None, bvid="BV1dG4y1o7Ji", singers=["洛天依"])
     ctx.api = _FakeApi(hit)
     _install_fake_duration(plug, None)
     sent = _install_fake_send(plug)

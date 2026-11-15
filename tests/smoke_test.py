@@ -121,7 +121,7 @@ def main() -> int:
         # 组件注册链路：唯一能在本地覆盖 Runner 注册的手段
         names = {item["name"] for item in plugin.get_components()}
         assert names == {
-            "点歌", "选歌", "点歌状态", "点歌自检",
+            "点歌", "选歌", "点歌状态", "点歌自检", "点歌联动自检",
             "本地歌", "本地库",
             "search_and_play_music", "play_local_music", "parse_music_link",
         }, f"组件集合异常: {names}"
@@ -165,6 +165,17 @@ def main() -> int:
             "自检报出的摘要与磁盘内容不符"
         )
         assert "md5sum" in report or "certutil" in report, "自检没有给出核对命令"
+
+        # ── 命令：VCPedia 联动自检 → 输出可见性/探测/计数三段 ──
+        ok, _resp, _level = await plugin.cmd_点歌联动自检(
+            matched_groups={"pfx": "/"}, stream_id="fake-stream"
+        )
+        assert ok is True, "联动自检命令失败"
+        report = host.sent_texts[-1] or ""
+        assert "点歌 × VCPedia 联动自检" in report, f"联动自检输出异常: {report}"
+        assert "API 可见性" in report and "探测" in report and "运行计数" in report, (
+            f"联动自检缺少三段信息: {report}"
+        )
 
         # ── 命令：前缀不匹配 → 不处理也不拦截 ──
         ok, _resp, level = await plugin.cmd_点歌(

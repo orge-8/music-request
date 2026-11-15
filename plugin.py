@@ -108,12 +108,43 @@ __plugin_id__ = "github.orge-8.music-request"
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_CONFIG_VERSION = "1.7.7"
+SUPPORTED_CONFIG_VERSION = "1.8.0"
 
 #: 歌词曲库插件 ID —— 本插件向它查询「某首 V家曲的原曲 B站标识」。
 #: 通过跨插件只读 API `get_song_bilibili` 调用（能力 `api.call`）。
 #: 未安装 / 未启用 / 未收录时一律静默回退到 B站搜索，不报错。
 VCPEDIA_PLUGIN_ID = "org.mai-mai.cv-lyric-context"
+
+#: VCPedia 联动查询结果的分类（v1.8.0 联动加固 P1-C）。
+#: 此前所有失败都只有一条 INFO 日志，真机排查分不清「插件没装」还是
+#: 「超时」还是「库里没这首歌」。分类后内存计数，/点歌联动自检 可查。
+#: 全部是内存态：重启清零，不落盘、不上报。
+_VCPEDIA_OUTCOMES: Tuple[str, ...] = (
+    "hit",                    # 命中原曲并直连（含 prefix 采纳）
+    "not_found_or_no_bvid",   # 库里没这首歌 / 有歌但没采集 B站标识 / 点名翻唱
+    "timeout",                # 超过契约 3s 预算（wait_for 兜底或 Host 超时）
+    "not_installed",          # Host 找不到提供方插件（未安装/未启用）
+    "no_api_proxy",           # 老 Host 没有 ctx.api 能力代理
+    "schema_mismatch",        # 返回形状不符合契约（占位结构/旧版缺键等）
+    "error",                  # 其它未预期异常
+)
+
+
+def _classify_vcpedia_exception(exc: BaseException) -> str:
+    """把跨插件调用异常归到五分类之一（供日志与计数）。
+
+    判据按「最具体优先」：AttributeError 一定是代理缺失；超时单列；
+    「未安装/未启用」靠 Host 错误消息关键词识别（Host 侧找不到提供方
+    时抛 RuntimeError，消息含这些词）；其余归 error。
+    """
+    if isinstance(exc, AttributeError):
+        return "no_api_proxy"
+    if isinstance(exc, asyncio.TimeoutError):
+        return "timeout"
+    msg = str(exc)
+    if any(k in msg for k in ("未安装", "未启用", "not found", "not installed", "找不到")):
+        return "not_installed"
+    return "error"
 
 #: LLM 工具入参里的「显式平台」别名表。
 #:
@@ -598,6 +629,8 @@ class MusicRequestPlugin(MaiBotPlugin):
         self._local_upload_inflight: set = set()
         # 最近一条入站用户消息（按会话）：工具载荷里没有原话，参数校验要用
         self._inbound_text = _RecentInboundText()
+        # VCPedia 联动结果计数（内存态，重启清零）：/点歌联动自检 展示
+        self._vcpedia_stats: Dict[str, int] = {k: 0 for k in _VCPEDIA_OUTCOMES}
 
     # ---------- 基础设施 ----------
 
@@ -1072,24 +1105,65 @@ class MusicRequestPlugin(MaiBotPlugin):
             命中原曲时返回单元素候选（`song_id` 为 BV 号或 `av<N>`），
             否则 None。
         """
+        song, outcome = await self._vcpedia_lookup(keyword, trigger_text)
+        if outcome is not None:
+            self._vcpedia_stats[outcome] = self._vcpedia_stats.get(outcome, 0) + 1
+        return song
+
+    async def _vcpedia_lookup(
+        self, keyword: str, trigger_text: str = ""
+    ) -> Tuple[Optional[SongInfo], Optional[str]]:
+        """`_vcpedia_pinned_song` 的决策内核：返回 (候选, 结果分类)。
+
+        分类为 None 表示「没发起查询」（开关关闭 / 空关键词），不计数；
+        其余取值见 `_VCPEDIA_OUTCOMES`。拆成两层是为了让自检命令能复用
+        同一条真实链路做探测，又不污染计数。
+        """
         if not self.config.bilibili.vcpedia_lookup:
-            return None
+            return None, None
         query = (keyword or "").strip()
         if not query:
-            return None
+            return None, None
         try:
-            result = await self.ctx.api.call(
-                f"{VCPEDIA_PLUGIN_ID}.get_song_bilibili", name=query
+            # 契约 cv_music_v1 的 timeout_ms=3000：提供方 @API 已声明同值，
+            # 但老 Host 可能不认 metadata.timeout_ms（默认 60s RPC 预算），
+            # 消费方再兜一层 wait_for——超时走静默回退，绝不拖死点歌。
+            result = await asyncio.wait_for(
+                self.ctx.api.call(
+                    f"{VCPEDIA_PLUGIN_ID}.get_song_bilibili", name=query
+                ),
+                timeout=3.0,
             )
-        except AttributeError:
-            # 老版本 Host 没有 ctx.api 能力代理（SDK 2.1.0 才引入 @API/代理）
-            self.ctx.logger.debug("当前 Host 不支持跨插件 API 调用，跳过 VCPedia 查询")
-            return None
         except Exception as exc:  # noqa: BLE001 - 缺插件/超时都不该打断点歌
-            self.ctx.logger.info("VCPedia 曲库查询不可用，回退搜索（%s）: %r", query, exc)
-            return None
-        if not isinstance(result, dict) or not result.get("found"):
-            return None
+            outcome = _classify_vcpedia_exception(exc)
+            if outcome == "no_api_proxy":
+                # 老版本 Host 没有 ctx.api 能力代理（SDK 2.1.0 才引入 @API/代理）
+                self.ctx.logger.debug("当前 Host 不支持跨插件 API 调用，跳过 VCPedia 查询")
+            else:
+                self.ctx.logger.info(
+                    "VCPedia 曲库查询不可用，回退搜索（%s，分类=%s）: %r",
+                    query, outcome, exc,
+                )
+            return None, outcome
+        if not isinstance(result, dict) or "found" not in result:
+            # 契约必备键 found 缺失 = 形状漂移（含 Host 对未知能力返回的
+            # 占位结构 {"status": "ok", ...}），不能误当成「库里没这首歌」
+            self.ctx.logger.info(
+                "VCPedia 返回形状不符合契约（缺 found 键），回退搜索（%s）: %r", query, result
+            )
+            return None, "schema_mismatch"
+        # 契约版本协商（cv_music v1）：schema_version 缺失按 v1 宽容处理
+        # （兼容未升级的提供方）；显式给了非 1 的值 = 不兼容的未来契约，
+        # 不能按 v1 语义误读（G4），回退搜索并归类 schema_mismatch。
+        schema_version = result.get("schema_version", 1)
+        if schema_version != 1:
+            self.ctx.logger.info(
+                "VCPedia 契约版本不兼容（schema_version=%r，本插件只认 v1），回退搜索（%s）",
+                schema_version, query,
+            )
+            return None, "schema_mismatch"
+        if not result.get("found"):
+            return None, "not_found_or_no_bvid"
         match = str(result.get("match") or "")
         if match == "prefix":
             # 查询串里带了歌名之外的 token（通常是歌手）。分三种情况：
@@ -1120,7 +1194,7 @@ class MusicRequestPlugin(MaiBotPlugin):
                     "改走平台搜索",
                     query, extra,
                 )
-                return None
+                return None, "not_found_or_no_bvid"
         bvid = str(result.get("bvid") or "").strip()
         aid = result.get("aid")
         if bvid:
@@ -1132,7 +1206,7 @@ class MusicRequestPlugin(MaiBotPlugin):
             self.ctx.logger.info(
                 "VCPedia 命中「%s」但尚未采集 B站标识，回退搜索", query
             )
-            return None
+            return None, "not_found_or_no_bvid"
         display = str(result.get("name") or query).strip() or query
 
         # 时长闸：曲库的 duration 字段实测 100% 为空，只能现场查 pagelist
@@ -1145,12 +1219,13 @@ class MusicRequestPlugin(MaiBotPlugin):
                 "VCPedia 命中原曲但时长 %ds 超过直连上限 %ds，改走平台搜索: %s",
                 duration, _VCPEDIA_MAX_DIRECT_SECONDS, display,
             )
-            return None
+            # 查询本身是命中的，只是时长闸拦下直连——计数仍算 hit
+            return None, "hit"
 
         self.ctx.logger.info(
             "VCPedia 命中原曲，跳过 B站搜索: %s -> %s", display, song_id
         )
-        return SongInfo(song_id=song_id, name=display, platform=PLATFORM_BILI)
+        return SongInfo(song_id=song_id, name=display, platform=PLATFORM_BILI), "hit"
 
     async def _probe_bili_duration(self, video_id: str) -> Optional[int]:
         """查 B站视频总时长（秒）；B站未启用或查不到返回 None。
@@ -2193,6 +2268,96 @@ class MusicRequestPlugin(MaiBotPlugin):
         return sent, text, 2 if sent else 0
 
     @Command(
+        "点歌联动自检",
+        description="自检与 cv_lyric_context 的原曲联动：API 可见性、探测与失败分类计数",
+        pattern=_PFX + r"\s*点歌联动自检\s*$",
+    )
+    async def cmd_点歌联动自检(
+        self, matched_groups: Optional[Dict[str, str]] = None, **kwargs: Any
+    ) -> Tuple[bool, str, int]:
+        """VCPedia 联动自检（v1.8.0 联动加固 P1-C）。
+
+        三段信息：
+        1. `api.list` 可见性——提供方插件在不在、API 版本/超时声明对不对；
+        2. 真实探测——走与点歌完全相同的 `_vcpedia_lookup` 链路查一首探针歌，
+           给出结果分类（探测不计入运行计数）；
+        3. 内存计数——本次启动以来各分类的次数，重启清零。
+        """
+        groups = matched_groups if isinstance(matched_groups, dict) else {}
+        if not self._prefix_ok(str(groups.get("pfx") or "")):
+            return False, "", 0
+
+        stream_id = self._extract_stream_id(kwargs)
+        lines = [
+            "🔗 点歌 × VCPedia 联动自检",
+            f"提供方: {VCPEDIA_PLUGIN_ID}",
+            f"契约: cv_music v1（schema_version=1，超时预算 3000ms）",
+            f"查询开关 bilibili.vcpedia_lookup: "
+            + ("开" if self.config.bilibili.vcpedia_lookup else "关（不发起查询）"),
+        ]
+
+        # 1) api.list 可见性（老 Host / 无代理时降级为提示，不报错）
+        full_name = f"{VCPEDIA_PLUGIN_ID}.get_song_bilibili"
+        try:
+            listing = await asyncio.wait_for(
+                self.ctx.api.list(plugin_id=VCPEDIA_PLUGIN_ID), timeout=3.0
+            )
+        except AttributeError:
+            lines.append("API 可见性: 当前 Host 无 ctx.api 代理（老版本），联动自动跳过")
+            listing = None
+        except Exception as exc:  # noqa: BLE001 - 自检只报告，不抛错
+            lines.append(f"API 可见性: 查询失败（{_classify_vcpedia_exception(exc)}）: {exc}")
+            listing = None
+        if listing is not None:
+            entries = listing
+            if isinstance(listing, dict):  # 容错：未解包的原始返回
+                entries = listing.get("apis") or []
+            if not isinstance(entries, list):
+                entries = []
+            target = next(
+                (e for e in entries
+                 if isinstance(e, dict)
+                 and (e.get("full_name") == full_name
+                      or (e.get("plugin_id") == VCPEDIA_PLUGIN_ID
+                          and e.get("name") == "get_song_bilibili"))),
+                None,
+            )
+            if target is None:
+                lines.append("API 可见性: ❌ 不可见（插件未安装/未启用，或 API 未公开）")
+            else:
+                meta = target.get("metadata") or {}
+                lines.append(
+                    "API 可见性: ✅ 可见"
+                    f"（version={target.get('version')}，timeout_ms={meta.get('timeout_ms', '未声明→宿主默认60s')}）"
+                )
+
+        # 2) 真实探测：与点歌同一条链路；探针歌故意选 unlikely 命中，
+        #    拿到 not_found_or_no_bvid 即证明整条 RPC 往返健康。
+        if self.config.bilibili.vcpedia_lookup:
+            _song, outcome = await self._vcpedia_lookup("联动自检探针歌曲")
+            hint = {
+                "hit": "✅ 链路正常（探针歌竟被收录，按原曲直连）",
+                "not_found_or_no_bvid": "✅ 链路正常（曲库未收录探针歌，属预期）",
+                "timeout": "❌ 超时（>3s）：提供方负载或 Host RPC 异常",
+                "not_installed": "❌ 提供方插件未安装/未启用",
+                "no_api_proxy": "⚠️ 老 Host 无 api 代理，联动自动跳过",
+                "schema_mismatch": "❌ 返回形状不符合契约（版本不匹配？）",
+                "error": "❌ 未预期异常，详见日志",
+            }.get(outcome or "", "未发起查询")
+            lines.append(f"探测: {outcome or '无'} —— {hint}")
+        else:
+            lines.append("探测: 跳过（查询开关已关闭）")
+
+        # 3) 内存计数（本次启动以来；探测本身不计数）
+        lines.append("运行计数（重启清零）:")
+        for key in _VCPEDIA_OUTCOMES:
+            lines.append(f"  {key}: {self._vcpedia_stats.get(key, 0)}")
+
+        text = "\n".join(lines)
+        sent = bool(await self.ctx.send.text(text, stream_id))
+        return sent, text, 2 if sent else 0
+
+    @Command(
         "本地歌",
         description="播放本地歌曲库里的歌，用法 /本地歌 <关键词>",
         pattern=_PFX + r"\s*本地歌(?:\s+(?P<query>.+?))?\s*$",
@@ -2317,9 +2482,10 @@ class MusicRequestPlugin(MaiBotPlugin):
             "时才填 platform。"
             "若启用了本地歌曲库，本工具会优先在本地库里找（返回文本带「来自本地歌曲库」标记），"
             "没命中再搜音乐平台。\n"
-            "本工具已内置换源与重试；若返回播放失败，不要重复调用，直接告诉用户即可。"
-        ),
-        detailed_description=(
+            "本工具已内置换源与重试；若返回播放失败，不要重复调用，直接告诉用户即可。\n\n"
+            # SDK 2.22+ 的 normalize_tool_description 在 description 非空时会
+            # **丢弃** detailed_description（2.23.0 实测同行为）——参数指导
+            # （含「可点播查询」联动提示）必须并进 description 才能存活。
             "参数 query 为歌曲名，或「歌名 歌手」关键词。"
             "若上下文里已有其它插件给出的「可点播查询」串，直接把整串填进 query；"
             "不要把一句歌词当 query，也不要自己另猜歌名。\n"
@@ -2556,9 +2722,9 @@ class MusicRequestPlugin(MaiBotPlugin):
             "播放本地歌曲库（磁盘音频文件）里的歌。"
             "仅当用户明确想听本地/离线歌曲库里的歌时使用（如「从本地库放一首」「放本地的夜曲」）；"
             "普通点歌请用 search_and_play_music。"
-            "返回文本以「已发送文件」/「已播放本地歌曲」开头表示成功；失败时不要重复调用。"
-        ),
-        detailed_description=(
+            "返回文本以「已发送文件」/「已播放本地歌曲」开头表示成功；失败时不要重复调用。\n\n"
+            # 同 search_and_play_music：SDK 2.22+ 会丢弃 detailed_description，
+            # 参数指导并进 description。
             "参数 query 为歌名或「歌名 歌手」关键词，只在本机歌曲库目录内匹配，"
             "搜不到网络平台上的歌。\n"
             "参数 send_as：留空时按库配置的默认形态发送（通常为音频文件，保留原始音质）；"
@@ -2726,26 +2892,110 @@ class MusicRequestPlugin(MaiBotPlugin):
 
 # ================================================================ WebUI 显示层补丁
 #
-# 可视化模式的 FieldRenderer（dashboard/src/routes/plugin-config.tsx:163-361，
-# 1.3.1 布局）按 ui_type 渲染控件时只输出 label / hint / placeholder，
+# 可视化模式的 FieldRenderer（dashboard/src/routes/plugin-config.tsx，
+# MaiBot v1.4.4 复核）按 ui_type 渲染控件时只输出 label / hint / placeholder，
 # **从不渲染 description**；本插件字段的填法说明都写在 description 里，
 # 不搬进 hint，用户在配置页上一个字都看不到（源代码模式才见得到）。
 # 这里只改展示元数据，不碰任何配置键与校验语义。
 
-#: 默认收起的 section：标题自带「可选 / 默认关闭」的功能节。收起后标题
-#: 与说明仍可见，点开即可配置，避免整页卡片全开淹没常用配置。
-_WEBUI_COLLAPSED_SECTIONS: frozenset = frozenset({"netease", "napcat"})
+#: 默认收起的 section：凭据 / 高级可选功能节。收起后标题与说明仍可见，
+#: 点开即可配置，避免整页卡片全开淹没常用配置。
+#: qq 不在此列——uin + qqmusic_key 是 QQ音乐搜索必需项，新用户第一个要配；
+#: plugin / music 是主配置，前端恒展开 plugin。
+_WEBUI_COLLAPSED_SECTIONS: frozenset = frozenset(
+    {"netease", "napcat", "cache", "library", "bilibili"}
+)
 
 #: 手工指定的 section 标题（键 = section 名）；仅在 SDK 输出标题等于
 #: 节名（未配置 __ui_label__）时采用。
 _WEBUI_SECTION_TITLES: dict = {}
 
-#: 手工指定的字段 label（键 = 字段名）；仅在自动推导不可用时采用。
+#: 手工指定的字段 label（键 = (节名, 字段名)）；自动推导从 description
+#: 第一小句截取，CJK 没有词边界，硬切容易出「uin——QQ音乐登录账」这类
+#: 半句话 label，这些字段一律手工指定；其余字段仍走自动推导。
+#: napcat_dir 在 cache / library 两节里各有一个，语义不同，必须按节区分。
 _WEBUI_LABEL_OVERRIDES: dict = {
-    "http_url": "HTTP API 地址",
-    "storage_dir": "缓存目录",
+    ("music", "tool_default_mode"): "工具默认发送形态",
+    ("qq", "uin"): "登录账号 uin",
+    ("qq", "qqmusic_key"): "登录凭证 qqmusic_key",
+    ("netease", "music_u"): "MUSIC_U Cookie",
+    ("netease", "csrf_token"): "__csrf Cookie",
+    ("napcat", "http_url"): "HTTP API 地址",
+    ("napcat", "http_token"): "访问令牌",
+    ("cache", "storage_dir"): "缓存目录（MaiBot 侧）",
+    ("cache", "napcat_dir"): "缓存目录（NapCat 侧）",
+    ("cache", "expire_hours"): "缓存过期时间（小时）",
+    ("library", "music_dir"): "歌曲库目录（MaiBot 侧）",
+    ("library", "napcat_dir"): "歌曲库目录（NapCat 侧）",
+    ("library", "tool_prefer_local"): "工具优先查本地库",
+    ("bilibili", "sessdata"): "SESSDATA Cookie",
     # "buvid3 Cookie" 截断后回退成字段名本身，必须手工指定
-    "buvid3": "buvid3 Cookie",
+    ("bilibili", "buvid3"): "buvid3 Cookie",
+    ("bilibili", "vcpedia_lookup"): "优先查 VCPedia 曲库",
+}
+
+#: 格式敏感字段的占位提示（可视化模式输入框灰字，不改校验语义）。
+_WEBUI_FIELD_PLACEHOLDERS: dict = {
+    ("music", "command_prefix"): "如：/ 或 #",
+    ("netease", "music_u"): "如：MUSIC_U=001AbCd…（浏览器 Cookie 里复制）",
+    ("netease", "csrf_token"): "如：1a2b3c4d5e（与 MUSIC_U 配对）",
+    ("qq", "uin"): "如：123456789（QQ 号）",
+    ("qq", "qqmusic_key"): "如：qm_keystore 里的长串凭证",
+    ("napcat", "http_url"): "如：http://127.0.0.1:9999",
+    ("napcat", "http_token"): "留空 = 不鉴权",
+    ("cache", "storage_dir"): "留空 = 插件数据目录下的 audio_cache",
+    ("cache", "napcat_dir"): "如：/app/audio（Docker 挂载路径）；留空 = 同上",
+    ("library", "music_dir"): "如：D:/Music",
+    ("library", "napcat_dir"): "如：/music（Docker 挂载路径）；留空 = 同上",
+    ("bilibili", "sessdata"): "留空 = 匿名可用（音质上限 64k）",
+    ("bilibili", "buvid3"): "留空 = 自动获取",
+}
+
+#: 可视化模式的页签分组（layout.type = tabs）。
+#: 前端只渲染 tab.sections 里列出的节，**没列进任何页签的节会整块消失**，
+#: 所以未知/新增的节一律追加到最后一个页签（见 _apply_webui_tabs）。
+#: 宿主不认识 layout.tabs 时会走 auto 分支按 section.order 平铺，
+#: 不会丢内容——页签是渐进增强，不是硬依赖。
+_WEBUI_TABS: tuple = (
+    {"id": "play", "title": "点歌行为", "sections": ("plugin", "music", "qq")},
+    {"id": "platform", "title": "平台与登录", "sections": ("netease", "napcat", "bilibili")},
+    {"id": "local", "title": "本地与缓存", "sections": ("cache", "library")},
+)
+
+#: 节内字段分组（键 = 节名，值 = 字段名 → 组名）。前端按 order 排序后
+#: 依 group 首次出现顺序分块渲染 h3 小标题；未分组字段落在最前的无标题块。
+_WEBUI_FIELD_GROUPS: dict = {
+    "music": {
+        "search_limit": "搜索与选歌",
+        "relevance_floor": "搜索与选歌",
+        "auto_select_first": "搜索与选歌",
+        "select_timeout_seconds": "搜索与选歌",
+        "auto_parse_url": "链接与卡片解析",
+        "auto_parse_card": "链接与卡片解析",
+        "play_mode": "发送形态",
+        "tool_default_mode": "发送形态",
+        "voice_source": "发送形态",
+    },
+    "cache": {
+        "max_size_mb": "容量与清理",
+        "expire_hours": "容量与清理",
+        "cleanup_interval_hours": "容量与清理",
+        "max_file_size_mb": "容量与清理",
+        "download_timeout_seconds": "容量与清理",
+    },
+    "library": {
+        "music_dir": "目录",
+        "napcat_dir": "目录",
+        "send_mode": "发送与检索",
+        "tool_prefer_local": "发送与检索",
+        "refresh_minutes": "发送与检索",
+        "search_limit": "发送与检索",
+    },
+}
+
+#: 安全可加的步进提示（只影响数字输入框的步进按钮，与 min/max 校验无关）。
+_WEBUI_FIELD_STEPS: dict = {
+    ("music", "relevance_floor"): 0.05,
 }
 
 
@@ -2777,8 +3027,36 @@ def _webui_label_from_description(description: str) -> str:
     return text if len(text) >= 2 else ""
 
 
+def _apply_webui_tabs(schema: dict) -> dict:
+    """把 section 分组到页签（layout.type = tabs）。
+
+    前端（``routes/plugin-config.tsx``）在 tabs 布局下**只渲染 tab.sections 里
+    列出的节**，没被任何页签引用的节会整块消失。所以这里做两件事：
+    ① 只保留实际存在的节；② 把所有未归类的节追加到最后一个页签。
+    宿主不支持 tabs 时会退回 auto 平铺，内容不丢。
+    """
+
+    sections = schema.get("sections")
+    if not isinstance(sections, dict) or not sections:
+        return schema
+    tabs: list = []
+    grouped: list = []
+    for spec in _WEBUI_TABS:
+        names = [name for name in spec["sections"] if name in sections]
+        if not names:
+            continue
+        tabs.append({"id": spec["id"], "title": spec["title"], "sections": names})
+        grouped.extend(names)
+    leftover = [name for name in sections if name not in grouped]
+    if not tabs:
+        return schema
+    tabs[-1]["sections"].extend(leftover)
+    schema["layout"] = {"type": "tabs", "tabs": tabs}
+    return schema
+
+
 def _apply_webui_display_polish(schema: dict) -> dict:
-    """把 description 抄进 hint、补中文 label / 节标题、收起可选功能节。"""
+    """把 description 抄进 hint、补中文 label / 节标题、收起可选节、分组页签。"""
     if not isinstance(schema, dict):
         return schema
     sections = schema.get("sections")
@@ -2796,6 +3074,7 @@ def _apply_webui_display_polish(schema: dict) -> dict:
             )
             if new_title and new_title != name:
                 section["title"] = new_title
+        groups = _WEBUI_FIELD_GROUPS.get(name) or {}
         for fname, field in (section.get("fields") or {}).items():
             if not isinstance(field, dict):
                 continue
@@ -2803,14 +3082,23 @@ def _apply_webui_display_polish(schema: dict) -> dict:
                 field["hidden"] = True  # 插件自维护字段：可视化模式不渲染，源代码模式仍可见
             if not field.get("hint") and field.get("description"):
                 field["hint"] = field["description"]
-            label = field.get("label")
-            if (not label or label == fname) and field.get("description"):
-                new_label = _WEBUI_LABEL_OVERRIDES.get(fname) or _webui_label_from_description(
-                    field["description"]
-                )
-                if new_label and new_label != fname:
-                    field["label"] = new_label
-    return schema
+            key = (name, fname)
+            if not field.get("placeholder") and key in _WEBUI_FIELD_PLACEHOLDERS:
+                field["placeholder"] = _WEBUI_FIELD_PLACEHOLDERS[key]
+            if key in _WEBUI_FIELD_STEPS and not field.get("step"):
+                field["step"] = _WEBUI_FIELD_STEPS[key]
+            if fname in groups and not field.get("group"):
+                field["group"] = groups[fname]
+            # 手工 label 优先：自动推导只在前者缺席时兜底
+            if key in _WEBUI_LABEL_OVERRIDES:
+                field["label"] = _WEBUI_LABEL_OVERRIDES[key]
+            else:
+                label = field.get("label")
+                if (not label or label == fname) and field.get("description"):
+                    new_label = _webui_label_from_description(field["description"])
+                    if new_label and new_label != fname:
+                        field["label"] = new_label
+    return _apply_webui_tabs(schema)
 
 
 def create_plugin() -> MusicRequestPlugin:
